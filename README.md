@@ -28,3 +28,14 @@ arachnonestor/
 │   └── utils.py                # Helper functions for both backend/frontend
 │
 └── README.md                   # Documentation about the project
+
+
+
+MINI PC Layout
+
+#Back Side
+
+GND  1   1   GND   GND
+1  1   1   GND   1
+
+# Front Side
