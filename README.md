@@ -28,3 +28,13 @@ arachnonestor/
 │   └── utils.py                # Helper functions for both backend/frontend
 │
 └── README.md                   # Documentation about the project
+
+
+
+sudo gpiodetect
+gpioinfo gpiochip0
+
+# set GP80 high
+sudo gpioset gpiochip0 0=1
+# set GP80 low
+sudo gpioset gpiochip0 0=0
