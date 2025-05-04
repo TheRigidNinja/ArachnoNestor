@@ -130,29 +130,30 @@ def interactive_batch():
 def main():
     print(f"Connecting to ESP32 at {ESP_IP}:{ESP_PORT}…")
     try:
-        with socket.create_connection((ESP_IP, ESP_PORT), timeout=5) as sock:
-            print("✅ Connected.  Commands:")
-            print("  BATCH     → interactive JSON batch send")
-            print("  MOVE      → move one motor by distance")
-            print("  QUIT      → exit")
-            while True:
-                cmd = input("> ").strip().lower()
-                if cmd in ("quit","q"):
-                    break
-                elif cmd in ("batch","b"):
-                    batch = interactive_batch()
-                    if batch:
-                        send_motor_batch(sock, batch)
-                elif cmd in ("move","m"):
-                    motor = int(input(" Motor ID: "))
-                    dirc  = input(" Forward? [y/N]: ").strip().lower().startswith("y")
-                    pwm   = int(input(" PWM % (0–100): "))
-                    dist  = float(input(" Distance (m): "))
-                    ppr   = int(input(" Pulses/rev: "))
-                    circ  = float(input(" Wheel circ (m): "))
-                    move_distance(sock, motor, dirc, pwm, dist, ppr, circ)
-                else:
-                    print("Unknown—type BATCH, MOVE, or QUIT.")
+        socket.create_connection((ESP_IP, ESP_PORT), timeout=5)
+        # with socket.create_connection((ESP_IP, ESP_PORT), timeout=5) as sock:
+        #     print("✅ Connected.  Commands:")
+        #     print("  BATCH     → interactive JSON batch send")
+        #     print("  MOVE      → move one motor by distance")
+        #     print("  QUIT      → exit")
+        #     while True:
+        #         cmd = input("> ").strip().lower()
+        #         if cmd in ("quit","q"):
+        #             break
+        #         elif cmd in ("batch","b"):
+        #             batch = interactive_batch()
+        #             if batch:
+        #                 send_motor_batch(sock, batch)
+        #         elif cmd in ("move","m"):
+        #             motor = int(input(" Motor ID: "))
+        #             dirc  = input(" Forward? [y/N]: ").strip().lower().startswith("y")
+        #             pwm   = int(input(" PWM % (0–100): "))
+        #             dist  = float(input(" Distance (m): "))
+        #             ppr   = int(input(" Pulses/rev: "))
+        #             circ  = float(input(" Wheel circ (m): "))
+        #             move_distance(sock, motor, dirc, pwm, dist, ppr, circ)
+        #         else:
+        #             print("Unknown—type BATCH, MOVE, or QUIT.")
     except Exception as e:
         print("❌ Connection failed:", e)
 
