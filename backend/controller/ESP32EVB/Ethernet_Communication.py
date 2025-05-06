@@ -2,165 +2,238 @@
 import socket
 import json
 import time
+import math
+from contextlib import contextmanager
+from dataclasses import dataclass
 
-ESP_IP   = "192.168.2.123"
-ESP_PORT = 5000
+ESP_IP = "192.168.2.123"  # Must match ESP32's static IP
+ESP_PORT = 5000            # Must match ESP32's TCP port
+CONNECTION_TIMEOUT = 5.0   # Timeout in seconds
 
-# -- Low-level socket wrappers ------------------------------------------
-def send_raw(sock, s: str):
-    sock.sendall(s.encode())
+@dataclass
+class PIDConfig:
+    kp: float = 0.5
+    ki: float = 0.01
+    kd: float = 0.1
+    integral_max: float = 100.0
+    output_max: float = 100.0
 
-def recv_line(sock, timeout: float = 2.0) -> str:
-    sock.settimeout(timeout)
-    data = b""
-    while True:
-        chunk = sock.recv(1)
-        if not chunk or chunk == b"\n":
-            break
-        data += chunk
-    return data.decode().strip()
-
-# -- JSON batch sender --------------------------------------------------
-def send_motor_batch(sock, batch: list):
-    """
-    Send one JSON batch to the ESP32 over an already-open socket.
-    Batch = list of { "id":int, "enable":bool, "direction":"forward"/"reverse", "pwm":int }
-    """
-    payload = {"motors": batch}
-    s = json.dumps(payload) + "\n"
-    send_raw(sock, s)
-    # wait for simple ack:
-    ack = recv_line(sock)
-    print("↩️  ESP reply:", ack)
-
-# -- Single-motor raw commands ------------------------------------------
-def get_pulses(sock, m: int) -> int:
-    """Ask ESP32 for motor m's pulse count."""
-    cmd = f"GET_PULSES_{m}\n"
-    send_raw(sock, cmd)
-    resp = recv_line(sock)
-    # expect "M{m} Pulses={value}"
-    try:
-        _, val = resp.split("=", 1)
-        return int(val)
-    except:
-        raise RuntimeError("Bad GET_PULSES response: " + resp)
-
-def set_pwm(sock, m: int, pct: int):
-    send_raw(sock, f"SET_PWM_{m}_{pct}\n")
-
-def set_enable(sock, m: int, on: bool):
-    cmd = "ENABLE"  if on else "DISABLE"
-    send_raw(sock, f"{cmd}_{m}\n")
-
-def set_direction(sock, m: int, forward: bool):
-    cmd = "FORWARD" if forward else "REVERSE"
-    send_raw(sock, f"{cmd}_{m}\n")
-
-# -- High-level motion helper --------------------------------------------
-def move_distance(sock, motor: int,
-                  forward: bool,
-                  pwm_pct: int,
-                  distance_m: float,
-                  pulses_per_rev: int,
-                  wheel_circumference_m: float):
-    """
-    Spin motor in 'forward' (True) or reverse (False) at pwm_pct until
-    it moves 'distance_m' meters (using pulses_per_rev & wheel_circumference_m).
-    """
-    # 1) sample start
-    start = get_pulses(sock, motor)
-    print(f"↪️  start pulses = {start}")
-
-    # 2) configure motor
-    set_enable(sock, motor, True)
-    set_direction(sock, motor, forward)
-    set_pwm(sock, motor, pwm_pct)
-
-    # 3) compute how many pulses we need
-    target_pulses = distance_m / wheel_circumference_m * pulses_per_rev
-    print(f"🎯 target delta pulses = {target_pulses:.1f}")
-
-    # 4) wait until reached
-    while True:
-        now = get_pulses(sock, motor)
-        delta = now - start
-        print(f"  ↪ now={now}  delta={delta}", end="\r")
-        if forward and delta >= target_pulses:
-            break
-        if not forward and delta <= -target_pulses:
-            break
-        time.sleep(0.02)
-
-    # 5) stop
-    set_pwm(sock, motor, 0)
-    set_enable(sock, motor, False)
-    print(f"\n✅ reached distance, final pulses={get_pulses(sock, motor)}")
-
-# -- Interactive CLI -----------------------------------------------------
-def interactive_batch():
-    """
-    Build a batch list interactively.
-    User types lines like: 0 on forward 50
-      (id, enable:on|off, forward|reverse, pwm%)
-    Terminate by empty line.
-    """
-    batch = []
-    print("Enter one line per motor: '<id> <on/off> <forward/reverse> <pwm%>'")
-    print("Blank line when done.")
-    while True:
-        line = input("→ ").strip()
-        if not line:
-            break
+class ESP32MotorController:
+    def __init__(self, pulses_per_meter=1000):
+        """Initialize controller with calibration constant"""
+        self.sock = None
+        self.pulses_per_meter = pulses_per_meter  # Pulses per meter of movement
+        
+    def connect(self):
+        """Establish connection to ESP32 using create_connection"""
         try:
-            mid, s_on, dirc, spwm = line.split()
-            m  = int(mid)
-            on = s_on.lower() in ("1","on","true","enable")
-            pw = int(spwm)
-            batch.append({
-                "id":        m,
-                "enable":    on,
-                "direction": dirc.lower(),
-                "pwm":       pw
-            })
-        except:
-            print(" ⚠️  invalid format, try again")
-    return batch
+            self.sock = socket.create_connection(
+                (ESP_IP, ESP_PORT),
+                timeout=CONNECTION_TIMEOUT
+            )
+            self.sock.setblocking(False)
+            print(f"✅ Connected to ESP32 at {ESP_IP}:{ESP_PORT}")
+            return True
+        except socket.timeout:
+            print("⌛ Connection timed out")
+            return False
+        except ConnectionRefusedError:
+            print("❌ Connection refused - is the ESP32 server running?")
+            return False
+        except Exception as e:
+            print(f"⚠️ Connection failed: {type(e).__name__}: {e}")
+            return False
+
+    def _ensure_connection(self):
+        """Ensure we have an active connection"""
+        if self.sock is None:
+            if not self.connect():
+                raise RuntimeError("No active connection to ESP32")
+
+    def send_command(self, command):
+        """Send JSON command and wait for response"""
+        self._ensure_connection()
+        
+        try:
+            data = (json.dumps(command) + "\n").encode()
+            self.sock.sendall(data)
+            return self._recv_response()
+        except socket.timeout:
+            print("⌛ Response timeout")
+            return None
+        except Exception as e:
+            print(f"⚠️ Communication error: {type(e).__name__}: {e}")
+            self.close()
+            return None
+
+    def _recv_response(self, timeout=2.0):
+        """Receive response with timeout handling"""
+        response = b""
+        start_time = time.time()
+        
+        while True:
+            try:
+                chunk = self.sock.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+                if b"\n" in response:
+                    break
+            except BlockingIOError:
+                if time.time() - start_time > timeout:
+                    raise socket.timeout()
+                time.sleep(0.01)
+                continue
+                
+        return json.loads(response.decode().strip()) if response else None
+
+    @contextmanager
+    def connection(self):
+        """Context manager for connection handling"""
+        try:
+            self.connect()
+            yield self
+        finally:
+            self.close()
+
+    def close(self):
+        """Close connection cleanly"""
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            finally:
+                self.sock = None
+
+    # Basic Motor Control
+    def control_motor(self, motor_id, enable=None, direction=None, pwm=None):
+        """Direct motor control"""
+        command = {
+            "motors": [{
+                "id": motor_id,
+                "enable": enable if enable is not None else False,
+                "direction": "forward" if direction else "reverse",
+                "pwm": pwm if pwm is not None else 0
+            }]
+        }
+        return self.send_command(command)
+
+    def get_pulses(self, motor_id=None):
+        """Get pulse counts"""
+        if motor_id is not None:
+            command = {"motors": [{"id": motor_id, "pulses": True}]}
+        else:
+            command = {"motors": [{"id": i, "pulses": True} for i in range(4)]}
+            
+        return self.send_command(command)
+
+    # Closed-Loop Position Control
+    def set_pid(self, motor_id, pid_config):
+        """Configure PID parameters for a motor"""
+        return self.send_command({
+            "motors": [{
+                "id": motor_id,
+                "pid": {
+                    "kp": pid_config.kp,
+                    "ki": pid_config.ki,
+                    "kd": pid_config.kd
+                }
+            }]
+        })
+
+    def move_to_position(self, motor_id, position_meters, tolerance=0.01, timeout=10.0):
+        """Move motor to absolute position (meters)"""
+        target_pulses = int(position_meters * self.pulses_per_meter)
+        tolerance_pulses = int(tolerance * self.pulses_per_meter)
+        
+        response = self.send_command({
+            "motors": [{
+                "id": motor_id,
+                "target": target_pulses
+            }]
+        })
+        
+        if response is None:
+            return False
+
+        # Wait until position is reached
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            current = self.get_pulses(motor_id)
+            if current is None:
+                return False
+                
+            error = abs(target_pulses - current)
+            if error <= tolerance_pulses:
+                return True
+                
+            time.sleep(0.1)
+        
+        return False
+
+    def move_distance(self, motor_id, distance_meters, **kwargs):
+        """Move motor relative distance (meters)"""
+        current = self.get_pulses(motor_id)
+        if current is None:
+            return False
+            
+        target_position = (current / self.pulses_per_meter) + distance_meters
+        return self.move_to_position(motor_id, target_position, **kwargs)
+
+    def calibrate_pulses_per_meter(self, motor_id, test_distance=0.1):
+        """Automatically determine pulses per meter"""
+        print(f"Calibrating motor {motor_id}...")
+        
+        # Move forward known distance
+        start = self.get_pulses(motor_id)
+        if start is None:
+            return False
+            
+        self.control_motor(motor_id, enable=True, direction=True, pwm=50)
+        time.sleep(2)  # Move for fixed time
+        self.control_motor(motor_id, enable=False)
+        
+        end = self.get_pulses(motor_id)
+        if end is None:
+            return False
+            
+        pulses = end - start
+        self.pulses_per_meter = pulses / test_distance
+        print(f"Calibration complete: {self.pulses_per_meter:.1f} pulses/meter")
+        return True
 
 def main():
-    print(f"Connecting to ESP32 at {ESP_IP}:{ESP_PORT}…")
-    try:
-        socket.create_connection((ESP_IP, ESP_PORT), timeout=5)
-        # with socket.create_connection((ESP_IP, ESP_PORT), timeout=5) as sock:
-        #     print("✅ Connected.  Commands:")
-        #     print("  BATCH     → interactive JSON batch send")
-        #     print("  MOVE      → move one motor by distance")
-        #     print("  QUIT      → exit")
-        #     while True:
-        #         cmd = input("> ").strip().lower()
-        #         if cmd in ("quit","q"):
-        #             break
-        #         elif cmd in ("batch","b"):
-        #             batch = interactive_batch()
-        #             if batch:
-        #                 send_motor_batch(sock, batch)
-        #         elif cmd in ("move","m"):
-        #             motor = int(input(" Motor ID: "))
-        #             dirc  = input(" Forward? [y/N]: ").strip().lower().startswith("y")
-        #             pwm   = int(input(" PWM % (0–100): "))
-        #             dist  = float(input(" Distance (m): "))
-        #             ppr   = int(input(" Pulses/rev: "))
-        #             circ  = float(input(" Wheel circ (m): "))
-        #             move_distance(sock, motor, dirc, pwm, dist, ppr, circ)
-        #         else:
-        #             print("Unknown—type BATCH, MOVE, or QUIT.")
-    except Exception as e:
-        print("❌ Connection failed:", e)
+    # Example usage
+    with ESP32MotorController().connection() as ctrl:
+        if not ctrl.sock:
+            return
+            
+        # 1. Calibration (run once)
+        # ctrl.calibrate_pulses_per_meter(0)
+        
+        # 2. Configure PID (tune these values)
+        pid_config = PIDConfig(kp=0.8, ki=0.05, kd=0.2)
+        ctrl.set_pid(0, pid_config)
+        
+        # 3. Basic motor test
+        print("Basic motor test:")
+        for i in range(3):
+            print(ctrl.control_motor(0, enable=True, direction=i%2, pwm=30))
+            time.sleep(1)
+            print(ctrl.control_motor(0, enable=False))
+            print("Pulses:", ctrl.get_pulses(0))
+            time.sleep(1)
+        
+        # 4. Closed-loop position control
+        print("\nPosition control test:")
+        print("Moving to 0.5m...")
+        if ctrl.move_to_position(0, 0.5):
+            print("Position reached!")
+        else:
+            print("Failed to reach position")
+        
+        print("Current position:", ctrl.get_pulses(0)[0]/ctrl.pulses_per_meter, "meters")
 
 if __name__ == "__main__":
     main()
-
-
-# 0 on forward 10
-# 0 off reverse 10
-# 0 off forward 10
