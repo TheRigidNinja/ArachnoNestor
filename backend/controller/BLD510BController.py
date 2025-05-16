@@ -11,7 +11,7 @@ BYTE_SIZE = serial.EIGHTBITS  # 8 data bits
 TIMEOUT = 1                   # Timeout in seconds
 
 # Modbus device address
-DEVICE_ADDRESS = 5  # Replace with your motor controller's address
+DEVICE_ADDRESS = 4  # Replace with your motor controller's address
 
 # Motor configuration
 MOTOR_POLES_PAIRS = 2  # Number of poles in the motor
@@ -290,17 +290,11 @@ def main():
         # run_for_revolutions(ser, target_rpm, num_revolutions, direction):
         # run_for_revolutions(ser, 500, 2, "F")
         start_motorFR(ser, "F")
-        write_rpm(ser, 300)
-        time.sleep(3)
-
-        write_rpm(ser,800)
-        time.sleep(20)
+        write_rpm(ser, 500)
+        time.sleep(4)
 
         start_motorFR(ser, "R")
-        time.sleep(20)
-
-        write_rpm(ser,300)
-        time.sleep(3)
+        time.sleep(4)
 
         # start_motorFR(ser, "R")
         # write_rpm(ser, 300)
