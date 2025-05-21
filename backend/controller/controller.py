@@ -1,15 +1,15 @@
 import time
 from motor_controller import MotorController
-from imu_client    import IMUClient
-from pid           import PID
+from imu_client      import IMUClient
+from pid             import PID
 
 class ArachnoNestor:
     def __init__(
         self,
-        motor_addrs,
-        base_rpm: int = 300,
-        pid_params: tuple = (1.2, 0.01, 0.1),
-        pid_limits: tuple = (-500,500)
+        motor_addrs: list[int],
+        base_rpm:    int    = 300,
+        pid_params:  tuple  = (1.2, 0.01, 0.1),
+        pid_limits:  tuple  = (-500, 500)
     ):
         self.motor    = MotorController(addresses=motor_addrs)
         self.imu      = IMUClient()
@@ -19,48 +19,56 @@ class ArachnoNestor:
         mn, mx     = pid_limits
         self.pid   = PID(kp, ki, kd, mn=mn, mx=mx)
 
-    def engage_motors(self, rpm: float):
-        """Write & start on all addresses."""
-        for addr in self.motor.addresses:
-            self.motor.write_rpm(addr, int(rpm))
-            self.motor.start(addr, forward=True)
+    def engage_motor(self, motor_id: int, rpm: float, forward: bool = True):
+        """Spin one motor."""
+        self.motor.write_rpm(motor_id, rpm)
+        self.motor.start(motor_id, forward)
+
+    def engage_motors(self, rpm: float, forward: bool = True):
+        """Spin all configured motors."""
+        for m in self.motor.addresses:
+            self.engage_motor(m, rpm, forward)
+
+            print(f"Motor {m}: {rpm:.0f} RPM {'forward' if forward else 'reverse'}")
+
+    def stop_motor(self, motor_id: int, brake: bool = False):
+        """Stop one motor."""
+        self.motor.stop(motor_id, brake)
 
     def stop_all(self, brake: bool = False):
-        for addr in self.motor.addresses:
-            self.motor.stop(addr, brake)
+        """Stop all motors."""
+        for m in self.motor.addresses:
+            self.stop_motor(m, brake)
 
     def balance_loop(self, sample_hz: float = 20.0):
+        """Example PID loop: hold roll at zero by adjusting RPM."""
         period = 1.0 / sample_hz
         self.imu.connect()
-        stream = self.imu.stream()
+        stream     = self.imu.stream()
         self.pid.reset()
 
         last_time = time.time()
         try:
             for reading in stream:
-                now    = time.time()
-                dt     = now - last_time if now > last_time else period
+                now = time.time()
+                dt  = now - last_time if now > last_time else period
                 last_time = now
 
-                roll = reading.roll  # current tilt
+                # read representative motor #1
+                meas = self.motor.read_speed(self.motor.addresses[0]) or 0.0
 
-                # PID: setpoint = 0° roll
-                corr_rpm = self.pid.update(0.0, roll, dt)
-                cmd_rpm  = self.base_rpm + corr_rpm
+                # compute PID correction around base_rpm
+                corr = self.pid.update(0.0, reading.roll, dt)
+                cmd  = self.base_rpm + corr
 
-                self.engage_motors(cmd_rpm)
-                print(f"roll={roll:+.2f}°  →  cmd RPM={cmd_rpm:.0f}")
+                self.engage_motors(cmd)
+                print(f"roll={reading.roll:+.2f}°  →  rpm={meas:.0f}  cmd={cmd:.0f}")
 
-                # maintain constant loop rate
-                sleep = period - (time.time() - now)
-                if sleep > 0:
-                    time.sleep(sleep)
+                # maintain steady loop rate
+                delay = period - (time.time() - now)
+                if delay > 0:
+                    time.sleep(delay)
 
         finally:
             self.stop_all(brake=False)
             self.imu.close()
-
-
-if __name__ == "__main__":
-    bot = ArachnoNestor([1,2,3,4], base_rpm=1200)
-    bot.balance_loop(20)

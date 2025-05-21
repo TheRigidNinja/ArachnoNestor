@@ -11,7 +11,7 @@ BYTE_SIZE = serial.EIGHTBITS  # 8 data bits
 TIMEOUT = 1                   # Timeout in seconds
 
 # Modbus device address
-DEVICE_ADDRESS = 4  # Replace with your motor controller's address
+DEVICE_ADDRESS = 1  # Replace with your motor controller's address
 
 # Motor configuration
 MOTOR_POLES_PAIRS = 2  # Number of poles in the motor
@@ -92,6 +92,8 @@ def write_rpm(ser, speed):
     
     # Combine the low and high bytes into a single 16-bit value (little-endian)
     speed_combined = (speed_low_byte << 8) | speed_high_byte
+
+    print(f"Setting speed to {speed} RPM (0x{speed_combined:04X})")
 
     # Send the command
     response = send_modbus_command(ser, 0x06, 0x8005, speed_combined)
@@ -290,11 +292,11 @@ def main():
         # run_for_revolutions(ser, target_rpm, num_revolutions, direction):
         # run_for_revolutions(ser, 500, 2, "F")
         # start_motorFR(ser, "F")
-        write_rpm(ser, 500)
+        write_rpm(ser, 200)
         # time.sleep(4)
 
-        start_motorFR(ser, "R")
-        time.sleep(8)
+        start_motorFR(ser, "F")
+        time.sleep(3)
 
         # start_motorFR(ser, "R")
         # write_rpm(ser, 300)
