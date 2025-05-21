@@ -1,9 +1,11 @@
-import serial, time, crcmod
+import serial, time
+from crcmod import crcmod
 
 class MotorController:
-    def __init__(self, port='/dev/ttyUSB0', baud=9600, addresses=[1,2,3,4]):
+    def __init__(self, port='/dev/ttyUSB0', baud=9600, addresses=[1,2,3,4],motor_poles_pair=2):
         self.ser = serial.Serial(port, baudrate=baud, timeout=1)
         self.addresses = addresses
+        self.motor_poles_pair = motor_poles_pair
         self._crc = crcmod.mkCrcFun(0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000)
 
     def _crc_bytes(self, frame: bytes) -> bytes:
@@ -27,22 +29,33 @@ class MotorController:
         return self._send(slave, 0x06, 0x8000, value=code)
 
     def stop(self, slave:int, brake:bool=False):
-        code = 0x0D02 if brake else 0x0A02  # GUI “Stop command” uses 0x0A02
+        code = 0x0D02 if brake else 0x0802
         return self._send(slave, 0x06, 0x8000, value=code)
 
     # speed
-    def set_speed(self, slave:int, rpm:int):
+    def write_rpm(self, slave:int, rpm:int):
         rpm = max(0, min(4000, rpm))
         raw = ((rpm & 0xFF)<<8) | (rpm>>8)
         return self._send(slave, 0x06, 0x8005, value=raw)
 
     def read_speed(self, slave:int):
-        resp = self._send(slave, 0x03, 0x8018, count=1)
+        resp = self._send(slave, 0x03, 0x8005, count=1)  
         if len(resp)>=7:
             raw = int.from_bytes(resp[3:5], 'little')
-            return raw  # actual RPM reading
+            return raw  # read set RPM
         return None
 
+    def read_actual_rpm(self, slave:int, rpm:int):
+        resp = self._send(slave, 0x03, 0x8018, count=1)
+
+        if len(resp)>=7:
+            raw = int.from_bytes(resp[3:5], 'little')
+            return raw  # read set RPM
+        
+        actual_rpm = (raw * 20) / (self.motor_poles_pair*2)
+        
+        return actual_rpm    
+    
     # torque & timing
     def set_torque(self, slave:int, start_torque:int, sensorless_speed:int):
         val = (start_torque<<8) | sensorless_speed
