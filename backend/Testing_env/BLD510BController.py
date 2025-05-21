@@ -289,12 +289,12 @@ def main():
         # time.sleep(1)
         # run_for_revolutions(ser, target_rpm, num_revolutions, direction):
         # run_for_revolutions(ser, 500, 2, "F")
-        start_motorFR(ser, "F")
+        # start_motorFR(ser, "F")
         write_rpm(ser, 500)
-        time.sleep(4)
+        # time.sleep(4)
 
         start_motorFR(ser, "R")
-        time.sleep(4)
+        time.sleep(8)
 
         # start_motorFR(ser, "R")
         # write_rpm(ser, 300)
