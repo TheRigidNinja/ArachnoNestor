@@ -36,12 +36,12 @@ class ArachnoNestor:
                 print(f"⚠️  Motor {m} no ACK on set RPM")
 
             # # 2) start
-            # ack = self.motor.start(m, forward)
-            # if ack:
-            #     dir_str = 'forward' if forward else 'reverse'
-            #     print(f"✅ Motor {m} started {dir_str}  ACK={ack.hex()}")
-            # else:
-            #     print(f"⚠️  Motor {m} no ACK on start")
+            ack = self.motor.start(m, forward)
+            if ack:
+                dir_str = 'forward' if forward else 'reverse'
+                print(f"✅ Motor {m} started {dir_str}  ACK={ack.hex()}")
+            else:
+                print(f"⚠️  Motor {m} no ACK on start")
 
 
     def balance_loop(self, sample_hz: float = 20.0):

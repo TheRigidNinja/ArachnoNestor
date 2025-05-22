@@ -89,20 +89,28 @@ class MotorController:
             else:
                 time.sleep(0.005)
         return None
-
+    
+    def _safe_send(self, frame, slave, fc, tries=4, timeout=0.2):
+        for i in range(tries):
+            print(f"⏳ Sending frame {i+1}/{tries} to slave {slave}...")
+            resp = self._send_and_recv(frame, slave, fc, timeout=timeout)
+            if resp:
+                return resp
+            
+        return None
+    
     # --- Core commands ---
-
     def write_rpm(self, slave: int, rpm: float) -> bytes | None:
         """Set target RPM (0–4000)."""
         r = max(0, min(4000, int(rpm)))
         raw = ((r & 0xFF) << 8) | (r >> 8)
         frame = self._build_frame(slave, 0x06, 0x8005, value=raw)
-        return self._send_and_recv(frame, slave, 0x06)
+        return self._safe_send(frame, slave, 0x06)
 
     def read_speed(self, slave: int) -> float | None:
         """Read actual RPM from register 0x8018."""
         frame = self._build_frame(slave, 0x03, 0x8018, count=1)
-        resp = self._send_and_recv(frame, slave, 0x03)
+        resp = self._safe_send(frame, slave, 0x03)
         if resp and len(resp) >= 7:
             raw = int.from_bytes(resp[3:5], 'little')
             return (raw * 20) / (self.motor_poles_pair * 2)
@@ -112,13 +120,13 @@ class MotorController:
         """Spin motor forward or reverse."""
         code = 0x0902 if forward else 0x0B02
         frame = self._build_frame(slave, 0x06, 0x8000, value=code)
-        return self._send_and_recv(frame, slave, 0x06)
+        return self._safe_send(frame, slave, 0x06)
 
     def stop(self, slave: int, brake: bool = False) -> bytes | None:
         """Natural (0x0A02) or brake (0x0D02) stop for one motor."""
         code = 0x0D02 if brake else 0x0A02
         frame = self._build_frame(slave, 0x06, 0x8000, value=code)
-        return self._send_and_recv(frame, slave, 0x06)
+        return self._safe_send(frame, slave, 0x06)
 
     # --- Batch stop ---
 
@@ -140,22 +148,22 @@ class MotorController:
     def set_torque(self, slave: int, start_torque: int, sensorless_speed: int) -> bytes | None:
         val = (start_torque << 8) | sensorless_speed
         frame = self._build_frame(slave, 0x06, 0x8002, value=val)
-        return self._send_and_recv(frame, slave, 0x06)
+        return self._safe_send(frame, slave, 0x06)
 
     def set_accel(self, slave: int, accel_t: int, decel_t: int) -> bytes | None:
         val = (accel_t << 8) | decel_t
         frame = self._build_frame(slave, 0x06, 0x8003, value=val)
-        return self._send_and_recv(frame, slave, 0x06)
+        return self._safe_send(frame, slave, 0x06)
 
     def set_current(self, slave: int, cont_current: int, type_flag: int) -> bytes | None:
         val = (cont_current << 8) | type_flag
         frame = self._build_frame(slave, 0x06, 0x8004, value=val)
-        return self._send_and_recv(frame, slave, 0x06)
+        return self._safe_send(frame, slave, 0x06)
 
     def set_brake_torque(self, slave: int, brake_val: int) -> bytes | None:
         frame = self._build_frame(slave, 0x06, 0x8006, value=brake_val)
-        return self._send_and_recv(frame, slave, 0x06)
+        return self._safe_send(frame, slave, 0x06)
 
     def set_address(self, slave: int, new_addr: int) -> bytes | None:
         frame = self._build_frame(slave, 0x06, 0x8007, value=new_addr)
-        return self._send_and_recv(frame, slave, 0x06)
+        return self._safe_send(frame, slave, 0x06)
