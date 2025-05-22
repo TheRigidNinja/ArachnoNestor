@@ -28,14 +28,18 @@ def main():
 
     def kill(msg=''):
         print(f"\n🛑 Abort: {msg}")
-        bot.stop_all(brake=True)
+
+        # bot.stop_all(brake=False)
+        bot.stop_all(brake=False)
+
+        # bot.stop_all(brake=True)
         sys.exit(1)
 
     signal.signal(signal.SIGINT, lambda *a: kill('SIGINT'))
 
     # MANUAL mode: fire & hold
     if args.mode == 'manual':
-        bot.engage_motors(args.rpm,forward=True)
+        bot.engage_motors(args.rpm,forward=False)
         print(f"▶ Manual: motors {args.motors} @ {args.rpm} RPM.")
         if args.duration:
             time.sleep(args.duration)

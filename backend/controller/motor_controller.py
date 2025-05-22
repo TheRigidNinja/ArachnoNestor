@@ -21,48 +21,48 @@ class MotorController:
     def _crc_bytes(self, frame: bytes) -> bytes:
         v = self._crc(frame)
         return bytes([v & 0xFF, (v >> 8) & 0xFF])
+    
+    def _build_frame(self, slave, fc, reg, value=None, count=None) -> bytes:
+        frame = bytearray([slave, fc]) + reg.to_bytes(2,'big')
+        if fc == 0x06 and value is not None:   frame += value.to_bytes(2,'big')
+        if fc == 0x03 and count  is not None:   frame += count.to_bytes(2,'big')
+        frame += self._crc_bytes(frame)
+        return frame
 
-    def _send(
-        self,
-        slave: int,
-        fc: int,
-        reg: int,
-        value: int | None = None,
-        count: int | None = None
-    ) -> bytes:
-        # build header
+    def send_no_ack(self, slave:int, fc:int, reg:int, value=None, count=None):
+        """Just push a Modbus frame onto RS-485 and return."""
+        frame = self._build_frame(slave, fc, reg, value, count)
+        # purge old input, in case a previous op left bytes
+        self.ser.reset_input_buffer()
+        self.ser.write(frame)
+        
+    # send command to slave
+    def _send(self, slave, fc, reg, value=None, count=None):
         frame = bytearray([slave, fc]) + reg.to_bytes(2, 'big')
         if fc == 0x06 and value is not None:
             frame += value.to_bytes(2, 'big')
-        if fc == 0x03 and count is not None:
+        if fc == 0x03 and count  is not None:
             frame += count.to_bytes(2, 'big')
         frame += self._crc_bytes(frame)
 
-        # Print the command in hex format before sending
-        response = None
-        hexcode = self.print_hex_string(frame.hex())
-        print(f"Command sent✅: {hexcode}")
+        # 1) purge any old bytes
+        self.ser.reset_input_buffer()
 
-        # ---------------- Send command ----------------
+        # 2) send
+        print("Command sent✅:", self.print_hex_string(frame.hex()))
         self.ser.write(frame)
-        # ---------------- Send command ----------------
 
-        #wait for response
-        time.sleep(0.05)
+        # 3) read exactly what we expect:
+        expected = 8 if fc == 0x06 else (5 + 2*count + 2)
+        response = self.ser.read(expected)
 
-        # ---------------- Read response ----------------
-        response = self.ser.read_all()
-        # ---------------- Read response ----------------
-
-        # Check if the response is valid
-        if response:
-            print(f"Response received📤: {response.hex()}")
+        if len(response) == expected:
+            print("Response received📤:", response.hex())
             return response
         else:
-            print("No response received🛑")
+            print(f"No response received🛑  (got {len(response)} bytes)")
             return None
-    
-        return 
+
     
     def print_hex_string(self, hex_string: str) -> str:
         """Format hex string for printing."""
@@ -100,8 +100,25 @@ class MotorController:
 
     def stop(self, slave: int, brake: bool = False) -> bytes:
         """Natural (0x0A02) or braking (0x0D02) stop."""
-        code = 0x0D02 if brake else 0x0A02
+        code = 0x0D02 if brake else 0x0802
+
+        print(f"Stopping motor {slave} with code {code:#06x}")
         return self._send(slave, 0x06, 0x8000, value=code)
+
+    def stop_all(self, brake: bool = False):
+        """
+        Stop each motor in sequence. Waits for each motor's echo
+        before moving on. Logs a warning if no echo arrives.
+        """
+        for m in self.addresses:
+            resp = self.stop(m, brake)
+            if resp is None:
+                print(f"Warning: no response from motor {m} after stop command")
+            else:
+                print(f"Motor {m} stopped with response: {resp.hex()}")
+            # time.sleep(0.07)
+            # dt = (time.time() - t0) * 1000  # ms
+            
 
     def set_torque(self, slave: int, start_torque: int, sensorless_speed: int) -> bytes:
         val = (start_torque << 8) | sensorless_speed

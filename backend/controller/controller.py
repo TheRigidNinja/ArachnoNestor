@@ -2,6 +2,7 @@ import time
 from motor_controller import MotorController
 from imu_client      import IMUClient
 from pid             import PID
+import asyncio
 
 class ArachnoNestor:
     def __init__(
@@ -18,6 +19,20 @@ class ArachnoNestor:
         kp, ki, kd = pid_params
         mn, mx     = pid_limits
         self.pid   = PID(kp, ki, kd, mn=mn, mx=mx)
+        
+    def engage_motors_fast(self, rpm: float, forward: bool = True):
+        # phase 1: set speed on every motor without blocking
+        raw_val = ((int(rpm)&0xFF)<<8) | ((int(rpm)>>8)&0xFF)
+        for m in self.motor.addresses:
+            self.motor.send_no_ack(m, 0x06, 0x8005, value=raw_val)
+
+        # tiny pause to let DE/RE flip if needed
+        time.sleep(0.01)
+
+        # phase 2: send start to all at once
+        code = 0x0902 if forward else 0x0B02
+        for m in self.motor.addresses:
+            self.motor.send_no_ack(m, 0x06, 0x8000, value=code)
 
     def engage_motor(self, motor_id: int, rpm: float, forward: bool = True):
         """Spin one motor."""
@@ -28,6 +43,7 @@ class ArachnoNestor:
         """Spin all configured motors."""
         for m in self.motor.addresses:
             self.engage_motor(m, rpm, forward)
+            time.sleep(0.1)  # wait for motor to start
 
             print(f"Motor {m}: {rpm:.0f} RPM {'forward' if forward else 'reverse'}")
 
@@ -39,6 +55,7 @@ class ArachnoNestor:
         """Stop all motors."""
         for m in self.motor.addresses:
             self.stop_motor(m, brake)
+            time.sleep(0.1)
 
     def balance_loop(self, sample_hz: float = 20.0):
         """Example PID loop: hold roll at zero by adjusting RPM."""
