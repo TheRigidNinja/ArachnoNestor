@@ -28,25 +28,21 @@ class ArachnoNestor:
         """
         for m in self.motor.addresses:
             # 1) set speed
+            # time.sleep(0.1)
             ack = self.motor.write_rpm(m, rpm)
             if ack:
                 print(f"✅ Motor {m} RPM set @ {rpm}  ACK={ack.hex()}")
             else:
                 print(f"⚠️  Motor {m} no ACK on set RPM")
 
-            # 2) start
-            ack = self.motor.start(m, forward)
-            if ack:
-                dir_str = 'forward' if forward else 'reverse'
-                print(f"✅ Motor {m} started {dir_str}  ACK={ack.hex()}")
-            else:
-                print(f"⚠️  Motor {m} no ACK on start")
+            # # 2) start
+            # ack = self.motor.start(m, forward)
+            # if ack:
+            #     dir_str = 'forward' if forward else 'reverse'
+            #     print(f"✅ Motor {m} started {dir_str}  ACK={ack.hex()}")
+            # else:
+            #     print(f"⚠️  Motor {m} no ACK on start")
 
-    def stop_all(self, brake: bool = False):
-        """
-        Delegate to MotorController.stop_all, which handles send+ACK.
-        """
-        self.motor.stop_all(brake)
 
     def balance_loop(self, sample_hz: float = 20.0):
         """
