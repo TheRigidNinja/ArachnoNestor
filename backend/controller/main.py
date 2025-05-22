@@ -1,90 +1,56 @@
 #!/usr/bin/env python3
-import argparse
-import signal
-import sys
 import time
-
 from controller import ArachnoNestor
 
-def main():
-    p = argparse.ArgumentParser(description="ArachnoNestor runner")
-    p.add_argument('--rpm',       type=int,   required=True,
-                   help='Target/base RPM')
-    p.add_argument('--motors',    nargs='+', type=int, required=True,
-                   help='Motor IDs to run (e.g. 1 2 3)')
-    p.add_argument('--mode',      choices=['manual','pid'], default='manual',
-                   help='manual: spin constant; pid: closed-loop control')
-    p.add_argument('--hz',        type=float, default=20.0,
-                   help='Loop frequency (PID mode only)')
-    p.add_argument('--duration',  type=float, default=None,
-                   help='Auto-stop after N seconds')
-    p.add_argument('--err-threshold', type=float, default=200,
-                   help='Max RPM error before abort (PID)')
-    p.add_argument('--err-timeout',   type=float, default=2.0,
-                   help='Seconds error must persist to kill (PID)')
-    args = p.parse_args()
+# Instantiate your robot once with the correct motor addresses
+bot = ArachnoNestor(motor_addrs=[1, 2, 3, 4], base_rpm=300)
 
-    bot = ArachnoNestor(args.motors, base_rpm=args.rpm)
 
-    def kill(msg=''):
-        print(f"\n🛑 Abort: {msg}")
+def manual_mode(rpm: int, motors: list[int], duration: float = None, forward: bool = True):
+    bot.engage_selected(rpm, forward, motors)
+    if duration is not None:
+        time.sleep(duration)
+        bot.stop_all(brake=True)
 
-        # bot.stop_all(brake=False)
-        # bot.stop_all(brake=False)
-        bot.motor.stop_all(brake=False)
 
-        # bot.stop_all(brake=True)
-        sys.exit(1)
+def move_axis(axis: str, direction: str, rpm: int, duration: float):
+    if axis.lower() == 'x':
+        positive = (direction == '+')
+        bot.move_x(rpm, positive)
+    elif axis.lower() == 'y':
+        positive = (direction == '+')
+        bot.move_y(rpm, positive)
+    elif axis.lower() == 'z':
+        up = (direction == '+')
+        bot.move_z(rpm, up)
+    else:
+        raise ValueError("Invalid axis: choose 'x', 'y', or 'z'")
 
-    signal.signal(signal.SIGINT, lambda *a: kill('SIGINT'))
+    time.sleep(duration)
+    bot.stop_all(brake=True)
 
-    # MANUAL mode: fire & hold
-    if args.mode == 'manual':
-        bot.engage_motors(args.rpm,forward=True)
-        print(f"▶ Manual: motors {args.motors} @ {args.rpm} RPM.")
-        if args.duration:
-            time.sleep(args.duration)
-            kill('timeout')
-        else:
-            signal.pause()
 
-    # PID mode: closed-loop with watchdog
-    now0 = time.time()
-    err_start = None
-    bot.imu.connect()
-    stream = bot.imu.stream()
-    bot.pid.reset()
-    print(f"▶ PID: target {args.rpm} RPM on {args.motors}.")
+def stabilize(duration: float, sample_hz: float = 20.0, pid_params: tuple[float, float, float] = (2.0, 0.1, 0.5)):
+    """
+    Balance the platform using IMU feedback for a set duration.
 
-    try:
-        for _ in stream:
-            t1 = time.time()
-            meas = bot.motor.read_speed(args.motors[0]) or 0.0
-            corr = bot.pid.update(args.rpm, meas, 1.0/args.hz)
-            cmd  = args.rpm + corr
-            bot.engage_motors(cmd)
+    :param duration: how long to stabilize (seconds)
+    :param sample_hz: control loop frequency
+    :param pid_params: (kp, ki, kd) gains for roll/pitch PID
+    """
+    bot.stabilize(duration, sample_hz, pid_params)
 
-            err = abs(args.rpm - meas)
-            if err > args.err_threshold:
-                if err_start is None:
-                    err_start = t1
-                elif t1 - err_start >= args.err_timeout:
-                    kill(f"RPM error {err:.0f} > {args.err_threshold}")
-            else:
-                err_start = None
 
-            if args.duration and (t1 - now0) >= args.duration:
-                kill('timeout')
-
-            print(f"rpm={meas:.0f}  cmd={cmd:.0f}  err={err:.0f}")
-            # enforce loop rate
-            delta = (1.0/args.hz) - (time.time() - t1)
-            if delta > 0:
-                time.sleep(delta)
-
-    finally:
-        bot.imu.close()
-        bot.stop_all(brake=False)
-
+# Example standalone sequence:
 if __name__ == '__main__':
-    main()
+    # 1) Manual: motors 1 & 4 at 200 RPM for 5s
+    manual_mode(200, [1], duration=5)
+
+    # 2) Cartesian move: +X at 300 RPM for 2s
+    # move_axis('x', '+', 300, 2)
+
+    # # 3) Cartesian move: -Y at 250 RPM for 4s
+    # move_axis('y', '-', 250, 4)
+
+    # # 4) Stabilize for 10s at 30Hz with custom PID
+    # stabilize(10, sample_hz=30, pid_params=(2.0, 0.1, 0.5))
