@@ -58,12 +58,6 @@ def stabilize(duration: float, sample_hz: float = 20.0, pid_params=(2.0,0.1,0.5)
 
 
 if __name__ == '__main__':
-    # Example sequence:
-    # RPM -- MOTORS -- DURATION (s) -- FORWARD
-    time.sleep(3)
-    # manual_mode(1000, [3], duration=5, forward=True)
-    # time.sleep(1)
-    manual_mode(2000, [3], duration=5, forward=False)
-    # move_axis('x', '+', 300, 2)
-    # move_axis('y', '-', 250, 4)
-    # stabilize(10, sample_hz=30, pid_params=(2.0,0.1,0.5))
+    # Motor actions are intentionally disabled to keep everything idle.
+    # Enable specific calls below once you're ready to drive hardware.
+    print("Controller loaded. No motor commands are being issued (idle mode).")

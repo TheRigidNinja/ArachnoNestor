@@ -1,6 +1,5 @@
 import time
 import serial
-import crcmod
 
 class MotorController:
     def __init__(
@@ -22,14 +21,19 @@ class MotorController:
 
         self.addresses        = addresses
         self.motor_poles_pair = motor_poles_pair
-        # CRC-16/MODBUS generator
-        self._crc = crcmod.mkCrcFun(
-            0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000
-        )
+        # CRC-16/MODBUS parameters (poly 0xA001, init 0xFFFF)
+        self._crc_init = 0xFFFF
 
     def _crc_bytes(self, frame: bytes) -> bytes:
-        v = self._crc(frame)
-        return bytes([v & 0xFF, v >> 8])
+        crc = self._crc_init
+        for b in frame:
+            crc ^= b
+            for _ in range(8):
+                if crc & 0x0001:
+                    crc = (crc >> 1) ^ 0xA001
+                else:
+                    crc >>= 1
+        return bytes([crc & 0xFF, (crc >> 8) & 0xFF])
 
     def _build_frame(
         self,

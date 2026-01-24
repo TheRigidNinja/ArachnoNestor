@@ -1,77 +1,36 @@
 #!/usr/bin/env python3
-import socket, json, time, serial
+import argparse
+import socket, json, time, serial, sys, struct
 from dataclasses import dataclass
 from contextlib import contextmanager
-import crcmod
 
-# ——————————————— IMU CLIENT ————————————————
+from evb_client import send_command  # uses binary TCP protocol
+
+# ——————————————— IMU via binary command 0x0A ————————————————
 ESP_IP      = "192.168.2.123"
 ESP_PORT    = 5000
 TIMEOUT_SEC = 5.0
+SAMPLE_HZ   = 20.0  # default loop rate
 
-@dataclass
-class IMUReading:
-    seq:      int
-    ts:       int
-    ver:      str
-    errs:     int
-    yaw:      float
-    pitch:    float
-    roll:     float
-    accel:    list[float]
-    gyro:     list[float]
-    mag:      list[float]
-    pressure: float
-    temp:     float
-    vbatt:    float
-    heap:     int
-
-class ESP32IMUClient:
-    def __init__(self, host=ESP_IP, port=ESP_PORT, timeout=TIMEOUT_SEC):
-        self.addr = (host, port)
-        self.timeout = timeout
-        self.sock = None
-        self.fd = None
-
-    def connect(self):
-        self.sock = socket.create_connection(self.addr, self.timeout)
-        self.fd   = self.sock.makefile("r")
-        print(f"✅ IMU connected to {self.addr}")
-
-    def close(self):
-        if self.fd:   self.fd.close()
-        if self.sock: self.sock.close()
-        print("🔌 IMU disconnected")
-
-    def __enter__(self):
-        self.connect()
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
-    def stream(self):
-        while True:
-            line = self.fd.readline()
-            if not line:
-                raise ConnectionError("ESP32 closed connection")
-            d = json.loads(line)
-            yield IMUReading(
-                seq      = int(d["seq"]),
-                ts       = int(d["ts"]),
-                ver      = d["ver"],
-                errs     = int(d["errs"]),
-                yaw      = float(d["yaw"]),
-                pitch    = float(d["pitch"]),
-                roll     = float(d["roll"]),
-                accel    = d["accel"],
-                gyro     = d["gyro"],
-                mag      = d["mag"],
-                pressure = float(d["pressure"]),
-                temp     = float(d["temp"]),
-                vbatt    = float(d["vbatt"]),
-                heap     = int(d["heap"])
-            )
+def get_imu_binary(host: str, port: int, timeout: float) -> dict:
+    """
+    Uses TCP command 0x0A (GET_IMU).
+    Payload layout (40B): [gyro 3x f32][accel 3x f32][temp f32][pitch f32][roll f32][yaw f32]
+    """
+    resp_type, payload = send_command(host, port, timeout, 0x0A, b"")
+    if resp_type == 0xE0:
+        raise RuntimeError(f"IMU device error: {payload.hex()}")
+    if resp_type != 0x0A or len(payload) != 40:
+        raise RuntimeError(f"IMU bad response type=0x{resp_type:02X} len={len(payload)}")
+    vals = struct.unpack("<10f", payload)
+    return {
+        "gyro": vals[0:3],
+        "accel": vals[3:6],
+        "temp_c": vals[6],
+        "pitch": vals[7],
+        "roll": vals[8],
+        "yaw": vals[9],
+    }
 
 # ——————————————— MOTOR CONTROLLER ————————————————
 SERIAL_PORT = '/dev/ttyUSB0'
@@ -81,11 +40,20 @@ TIMEOUT     = 1
 # list your four Modbus addresses here:
 DEVICE_ADDRESSES = [1, 2, 3, 4]
 
-# build CRC-16 (Modbus)
-crc16 = crcmod.mkCrcFun(0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000)
+# build CRC-16 (Modbus) inline to avoid external dependency
+def crc16_modbus(frame: bytes) -> int:
+    crc = 0xFFFF
+    for b in frame:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
 
 def calculate_crc(data: bytes) -> bytes:
-    v = crc16(data)
+    v = crc16_modbus(data)
     return bytes([v & 0xFF, (v >> 8) & 0xFF])
 
 def send_modbus_command(ser, slave: int, fc: int, addr: int, value=None, count=None):
@@ -131,49 +99,72 @@ class PID:
         return max(self.mn, min(self.mx, u))
 
 # ——————————————— MAIN LOOP ————————————————
-def main():
-    # 1) Open RS-485 port
-    ser = serial.Serial(port=SERIAL_PORT, baudrate=BAUD_RATE, timeout=TIMEOUT)
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="IMU-driven motor balance loop (testing env)")
+    ap.add_argument("--host", default=ESP_IP, help="ESP32 IMU host")
+    ap.add_argument("--port", type=int, default=ESP_PORT, help="ESP32 IMU port")
+    ap.add_argument("--timeout", type=float, default=TIMEOUT_SEC, help="ESP32 IMU socket timeout")
+    ap.add_argument("--sample-hz", type=float, default=SAMPLE_HZ, help="control loop rate")
+    ap.add_argument("--base-rpm", type=float, default=1000.0, help="baseline RPM before PID correction")
+    ap.add_argument("--no-motors", action="store_true", help="run loop without commanding motors")
+    ap.add_argument("--serial", default=SERIAL_PORT, help="RS485 serial port for motors")
+    args = ap.parse_args(argv)
+
+    # 1) Open RS-485 port (unless disabled)
+    ser = None
+    if not args.no_motors:
+        ser = serial.Serial(port=args.serial, baudrate=BAUD_RATE, timeout=TIMEOUT)
 
     # 2) Build PID for roll stabilization
     pid_roll = PID(kp=20.0, ki=0.1, kd=5.0, mn=-1000, mx=1000)
 
     # 3) Connect IMU stream
-    with ESP32IMUClient() as imu_client:
-        stream = imu_client.stream()
+    try:
         last = time.time()
-        print("↔️  Starting balance loop… Ctrl-C to exit")
-        try:
-            while True:
-                now = time.time()
-                dt = now - last
-                last = now
+        print("↔️  Starting balance loop (binary IMU 0x0A)… Ctrl-C to exit")
+        while True:
+            now = time.time()
+            dt = now - last
+            last = now
 
-                reading = next(stream)
-                roll = reading.roll  # degrees
+            imu = get_imu_binary(args.host, args.port, args.timeout)
+            roll = imu["roll"]  # degrees
 
-                # PID output: +ve → add speed, –ve → subtract
-                correction = pid_roll.update(roll, dt)
+            correction = pid_roll.update(roll, dt)
+            rpm_target = args.base_rpm + correction
 
-                # base speed + correction
-                base = 1000
-                rpm_target = base + correction
-
-                # send to all four devices
+            if not args.no_motors:
                 for dev in DEVICE_ADDRESSES:
                     write_rpm(ser, dev, rpm_target)
                     start_motor(ser, dev, forward=True)
 
-                print(f"roll={roll:+5.2f}°  corr={correction:+6.1f} → RPM={rpm_target:.0f}")
-                time.sleep(1.0/SAMPLE_HZ)
+            print(
+                f"roll={roll:+6.2f}° pitch={imu['pitch']:+6.2f} yaw={imu['yaw']:+6.2f} "
+                f"gyro=({imu['gyro'][0]:+.2f},{imu['gyro'][1]:+.2f},{imu['gyro'][2]:+.2f}) "
+                f"corr={correction:+7.1f} → RPM={rpm_target:.0f}"
+            )
+            time.sleep(max(0.0, (1.0 / args.sample_hz) - (time.time() - now)))
 
-        except KeyboardInterrupt:
-            print("\n🛑  Shutting down…")
-        finally:
-            # natural stop all motors
+    except (socket.timeout, TimeoutError):
+        print(f"IMU connection timed out to {args.host}:{args.port} (timeout={args.timeout}s)", file=sys.stderr)
+        return 1
+    except ConnectionRefusedError:
+        print(f"IMU connection refused at {args.host}:{args.port}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"IMU connection failed: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(f"IMU read failed: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n🛑  Shutting down…")
+    finally:
+        if ser is not None:
             for dev in DEVICE_ADDRESSES:
                 stop_motor(ser, dev, brake=False)
             ser.close()
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
