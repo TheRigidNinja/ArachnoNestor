@@ -1,0 +1,44 @@
+
+// #Activate env 
+{"source /home/arachnonestor/ArachnoNestor/backend/Testing_env/venv/bin/activate"}
+
+
+
+// See CPU MEM usage
+{"glances"}
+{"htop"}
+
+
+//  Shiw all connected cameras
+{"lv4l2-ctl --list-devices"}
+
+// Show all video devices
+{"ls /dev/video*"}
+
+// Show all audio devices
+{"arecord -l"}
+
+
+
+v4l2-ctl -d /dev/video0 --get-parm
+v4l2-ctl -d /dev/video0 --get-fmt-video
+
+// for i in 0 2 4 6; do   v4l2-ctl -d /dev/video$i --set-fmt-video=width=640,height=480,pixelformat=MJPG;   v4l2-ctl -d /dev/video$i --set-parm=15; done
+// for i in 8 10 12 14; do   v4l2-ctl -d /dev/video$i --set-fmt-video=width=160,height=120,pixelformat=MJPG;   v4l2-ctl -d /dev/video$i --set-parm=30; done
+
+// Check camera formats and frame rates
+for i in 0 2 4 6 8 10 12 14; do
+  v4l2-ctl -d /dev/video$i --get-fmt-video --get-parm
+done
+
+// Check USB devices and errors
+{"lsusb"}
+{"sudo dmesg | grep -i usb"}
+
+
+
+// sudo modprobe uvcvideo quirks=0x80
+
+sudo modprobe usbmon
+sudo usbtop
+// sudo apt install usbtop
