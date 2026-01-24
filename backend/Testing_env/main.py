@@ -4,22 +4,24 @@ import socket, json, time, serial, sys, struct
 from dataclasses import dataclass
 from contextlib import contextmanager
 
-from evb_client import send_command  # uses binary TCP protocol
+from evb_client import EvbClient, DeviceError  # persistent binary TCP client
 
 # ——————————————— IMU via binary command 0x0A ————————————————
 ESP_IP      = "192.168.2.123"
 ESP_PORT    = 5000
 TIMEOUT_SEC = 5.0
-SAMPLE_HZ   = 20.0  # default loop rate
+SAMPLE_HZ   = 50.0  # default loop rate (~20 ms period)
+MIN_INTERVAL = 0.02
+MAX_INTERVAL = 0.2
+BACKOFF = 1.5
+RECOVER = 0.9
 
-def get_imu_binary(host: str, port: int, timeout: float) -> dict:
+def get_imu_binary(cli: EvbClient) -> dict:
     """
     Uses TCP command 0x0A (GET_IMU).
     Payload layout (40B): [gyro 3x f32][accel 3x f32][temp f32][pitch f32][roll f32][yaw f32]
     """
-    resp_type, payload = send_command(host, port, timeout, 0x0A, b"")
-    if resp_type == 0xE0:
-        raise RuntimeError(f"IMU device error: {payload.hex()}")
+    resp_type, payload = cli.send(0x0A, b"")
     if resp_type != 0x0A or len(payload) != 40:
         raise RuntimeError(f"IMU bad response type=0x{resp_type:02X} len={len(payload)}")
     vals = struct.unpack("<10f", payload)
@@ -104,7 +106,11 @@ def main(argv=None):
     ap.add_argument("--host", default=ESP_IP, help="ESP32 IMU host")
     ap.add_argument("--port", type=int, default=ESP_PORT, help="ESP32 IMU port")
     ap.add_argument("--timeout", type=float, default=TIMEOUT_SEC, help="ESP32 IMU socket timeout")
-    ap.add_argument("--sample-hz", type=float, default=SAMPLE_HZ, help="control loop rate")
+    ap.add_argument("--sample-hz", type=float, default=SAMPLE_HZ, help="control loop rate (Hz)")
+    ap.add_argument("--min-interval", type=float, default=MIN_INTERVAL, help="minimum loop interval (s)")
+    ap.add_argument("--max-interval", type=float, default=MAX_INTERVAL, help="maximum loop interval (s)")
+    ap.add_argument("--backoff", type=float, default=BACKOFF, help="multiplier on device timeout")
+    ap.add_argument("--recover", type=float, default=RECOVER, help="multiplier to speed up after success")
     ap.add_argument("--base-rpm", type=float, default=1000.0, help="baseline RPM before PID correction")
     ap.add_argument("--no-motors", action="store_true", help="run loop without commanding motors")
     ap.add_argument("--serial", default=SERIAL_PORT, help="RS485 serial port for motors")
@@ -122,41 +128,60 @@ def main(argv=None):
     try:
         last = time.time()
         print("↔️  Starting balance loop (binary IMU 0x0A)… Ctrl-C to exit")
+        interval = max(args.min_interval, 1.0 / args.sample_hz if args.sample_hz > 0 else MIN_INTERVAL)
         while True:
-            now = time.time()
-            dt = now - last
-            last = now
+            # Establish or re-establish the TCP session
+            try:
+                with EvbClient(args.host, args.port, args.timeout) as cli:
+                    while True:
+                        loop_start = time.time()
+                        dt = loop_start - last
+                        last = loop_start
 
-            imu = get_imu_binary(args.host, args.port, args.timeout)
-            roll = imu["roll"]  # degrees
+                        try:
+                            imu = get_imu_binary(cli)
+                        except DeviceError as exc:
+                            if exc.code == 2:  # compact timeout, keep connection and backoff
+                                print(f"IMU device timeout (code=2); backing off…", file=sys.stderr)
+                                interval = min(args.max_interval, interval * args.backoff)
+                                time.sleep(interval)
+                                continue
+                            print(f"IMU device error: {exc}; reconnecting…", file=sys.stderr)
+                            break  # exit inner loop to reconnect
+                        except Exception as exc:
+                            print(f"IMU read failed ({exc}); reconnecting…", file=sys.stderr)
+                            break  # exit inner loop to reconnect
 
-            correction = pid_roll.update(roll, dt)
-            rpm_target = args.base_rpm + correction
+                        roll = imu["roll"]  # degrees
 
-            if not args.no_motors:
-                for dev in DEVICE_ADDRESSES:
-                    write_rpm(ser, dev, rpm_target)
-                    start_motor(ser, dev, forward=True)
+                        correction = pid_roll.update(roll, dt)
+                        rpm_target = args.base_rpm + correction
 
-            print(
-                f"roll={roll:+6.2f}° pitch={imu['pitch']:+6.2f} yaw={imu['yaw']:+6.2f} "
-                f"gyro=({imu['gyro'][0]:+.2f},{imu['gyro'][1]:+.2f},{imu['gyro'][2]:+.2f}) "
-                f"corr={correction:+7.1f} → RPM={rpm_target:.0f}"
-            )
-            time.sleep(max(0.0, (1.0 / args.sample_hz) - (time.time() - now)))
+                        if not args.no_motors:
+                            for dev in DEVICE_ADDRESSES:
+                                write_rpm(ser, dev, rpm_target)
+                                start_motor(ser, dev, forward=True)
 
-    except (socket.timeout, TimeoutError):
-        print(f"IMU connection timed out to {args.host}:{args.port} (timeout={args.timeout}s)", file=sys.stderr)
-        return 1
-    except ConnectionRefusedError:
-        print(f"IMU connection refused at {args.host}:{args.port}", file=sys.stderr)
-        return 1
-    except OSError as exc:
-        print(f"IMU connection failed: {exc}", file=sys.stderr)
-        return 1
-    except RuntimeError as exc:
-        print(f"IMU read failed: {exc}", file=sys.stderr)
-        return 1
+                        print(
+                            f"roll={roll:+6.2f}° pitch={imu['pitch']:+6.2f} yaw={imu['yaw']:+6.2f} "
+                            f"gyro=({imu['gyro'][0]:+.2f},{imu['gyro'][1]:+.2f},{imu['gyro'][2]:+.2f}) "
+                            f"corr={correction:+7.1f} → RPM={rpm_target:.0f}"
+                        )
+                        # maintain adaptive loop timing
+                        interval = max(args.min_interval, min(args.max_interval, interval * args.recover))
+                        sleep_for = max(0.0, interval - (time.time() - loop_start))
+                        time.sleep(sleep_for)
+
+            except (socket.timeout, TimeoutError):
+                print(f"IMU connection timed out to {args.host}:{args.port} (timeout={args.timeout}s); retrying…", file=sys.stderr)
+            except ConnectionRefusedError:
+                print(f"IMU connection refused at {args.host}:{args.port}; retrying…", file=sys.stderr)
+            except OSError as exc:
+                print(f"IMU connection failed: {exc}; retrying…", file=sys.stderr)
+
+            # small backoff before reconnect attempt
+            time.sleep(0.2)
+
     except KeyboardInterrupt:
         print("\n🛑  Shutting down…")
     finally:

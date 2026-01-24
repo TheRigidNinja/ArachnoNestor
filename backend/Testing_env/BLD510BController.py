@@ -292,7 +292,7 @@ def main():
         # run_for_revolutions(ser, target_rpm, num_revolutions, direction):
         # run_for_revolutions(ser, 500, 2, "F")
         # start_motorFR(ser, "F")
-        write_rpm(ser, 200)
+        write_rpm(ser, 400)
         # time.sleep(4)
 
         start_motorFR(ser, "F")
