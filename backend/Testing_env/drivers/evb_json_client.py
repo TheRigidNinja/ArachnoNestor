@@ -3,9 +3,15 @@ import socket, json, time, sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-ESP_IP = "192.168.2.123"
-ESP_PORT = 5000
-CONNECTION_TIMEOUT = 5.0
+from logutil.logger import get_logger
+
+from config.settings import load_config
+
+CONFIG = load_config()
+log = get_logger("drivers.evb_json_client")
+ESP_IP = CONFIG["evb"]["host"]
+ESP_PORT = CONFIG["evb"]["port"]
+CONNECTION_TIMEOUT = CONFIG["evb"]["timeout"]
 
 @dataclass
 class PIDConfig:
@@ -26,10 +32,10 @@ class ESP32MotorController:
                 (ESP_IP, ESP_PORT), timeout=CONNECTION_TIMEOUT
             )
             self.sock.setblocking(False)
-            print(f"✅ Connected to {ESP_IP}:{ESP_PORT}")
+            log.info(f"Connected to {ESP_IP}:{ESP_PORT}")
             return True
         except Exception as e:
-            print("❌ Connection failed:", e)
+            log.error(f"Connection failed: {e}")
             return False
 
     def _ensure_connection(self):
@@ -125,7 +131,7 @@ class ESP32MotorController:
         # tune your PID once
         pid = PIDConfig(kp=1.0, ki=0.08, kd=0.2,
                         integral_max=20.0, output_max=100.0)
-        print("🔧 Setting PID:", pid)
+        log.info(f"Setting PID: {pid}")
         self.send_command({"motors":[{"id":motor_id,"pid":vars(pid)}]})
 
         for i in range(cycles):
@@ -134,15 +140,15 @@ class ESP32MotorController:
             target = start + (step_pulses if forward else -step_pulses)
 
             dir_str = "forward" if forward else "reverse"
-            print(f"\n⏩ Cycle {i+1}/{cycles}: {dir_str} {step_pulses} pulses → {target}")
+            log.info(f"Cycle {i+1}/{cycles}: {dir_str} {step_pulses} pulses → {target}")
             self.move_to_target(motor_id, forward, pwm_limit, target)
             time.sleep(settle_delay)
 
             actual = self.get_pulses(motor_id)
             error  = actual - target
-            print(f"   Arrived at {actual}   error = {error:+d} pulses")
+            log.info(f"Arrived at {actual}   error = {error:+d} pulses")
 
-        print("\n✅ Rapid-flip test complete.")
+        log.info("Rapid-flip test complete.")
 
     def get_pulses(self, motor_id=0):
         cmd = {"motors":[{"id": motor_id, "pulses": True}]}

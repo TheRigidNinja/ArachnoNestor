@@ -2,16 +2,23 @@ import serial
 import time
 from crcmod import crcmod  # Install using: pip install crcmod
 
+from config.settings import load_config
+from logutil.logger import get_logger
+
+CONFIG = load_config()
+
+log = get_logger("drivers.bld510b")
+
 # RS485 configuration
-SERIAL_PORT = '/dev/ttyUSB0'  # Replace with your RS485 device
-BAUD_RATE = 9600              # Adjust based on your motor controller settings
+SERIAL_PORT = CONFIG["motion"]["serial_port"]
+BAUD_RATE = CONFIG["motion"]["baud_rate"]
 PARITY = serial.PARITY_NONE   # No parity
 STOP_BITS = serial.STOPBITS_ONE  # 1 stop bit
 BYTE_SIZE = serial.EIGHTBITS  # 8 data bits
 TIMEOUT = 1                   # Timeout in seconds
 
 # Modbus device address
-DEVICE_ADDRESS = 1  # Replace with your motor controller's address
+DEVICE_ADDRESS = CONFIG["motion"]["device_address"]
 
 # Motor configuration
 MOTOR_POLES_PAIRS = 2  # Number of poles in the motor
@@ -39,9 +46,8 @@ def send_modbus_command(ser, function_code, address, value=None, count=None):
     crc_values = calculate_crc(frame)
     frame.extend(crc_values)
 
-    # Print the command in a readable format
     spaced_string = space_hex_string(frame.hex())
-    print(f"Command sent: {spaced_string}")
+    log.debug(f"Command sent: {spaced_string}")
 
     # Send the command
     ser.write(frame)
@@ -50,10 +56,10 @@ def send_modbus_command(ser, function_code, address, value=None, count=None):
     time.sleep(0.15)
     response = ser.read_all()
     if response:
-        print(f"Response received: {response.hex()}")
+        log.debug(f"Response received: {response.hex()}")
         return response
     else:
-        print("No response received")
+        log.warning("No response received")
         return None
 
 ## ------------------------------------- Function to format a hex string with spaces
@@ -80,7 +86,7 @@ def stop_motor_braking(ser):
 def write_rpm(ser, speed):
     # Ensure speed is within valid range (0–4000 RPM)
     if speed < 0 or speed > 4000:
-        print("Error: Speed must be between 0 and 4000 RPM")
+        log.error("Speed must be between 0 and 4000 RPM")
         return
     
     # Convert speed to the appropriate value for the motor controller
@@ -93,15 +99,15 @@ def write_rpm(ser, speed):
     # Combine the low and high bytes into a single 16-bit value (little-endian)
     speed_combined = (speed_low_byte << 8) | speed_high_byte
 
-    print(f"Setting speed to {speed} RPM (0x{speed_combined:04X})")
+    log.info(f"Setting speed to {speed} RPM (0x{speed_combined:04X})")
 
     # Send the command
     response = send_modbus_command(ser, 0x06, 0x8005, speed_combined)
     
     if response:
-        print(f"Speed set to {speed} RPM successfully.")
+        log.info(f"Speed set to {speed} RPM successfully.")
     else:
-        print("Failed to set speed. Check wiring and Modbus address.")
+        log.error("Failed to set speed. Check wiring and Modbus address.")
 
 
 ## ------------------------------------- Function to read real speed (RPM)
@@ -115,10 +121,10 @@ def read_rpm(ser):
         # Extract set RPM **in little-endian**
         set_rpm = int.from_bytes(response[3:5], byteorder="little")  
 
-        print(f"Stored Set RPM: {set_rpm} RPM")
+        log.info(f"Stored Set RPM: {set_rpm} RPM")
         return set_rpm
     else:
-        print("Failed to read set RPM.")
+        log.error("Failed to read set RPM.")
         return None
 
 
@@ -137,10 +143,10 @@ def read_actual_rpm(ser):
         # Convert raw speed to actual RPM using the formula
         actual_rpm = (raw_speed * 20) / (MOTOR_POLES_PAIRS*2)
 
-        print(f"Actual RPM: {actual_rpm:.2f} RPM")
+        log.info(f"Actual RPM: {actual_rpm:.2f} RPM")
         return actual_rpm
     else:
-        print("Error: No valid RPM response received.")
+        log.error("No valid RPM response received.")
         return None
     
 
@@ -174,12 +180,12 @@ def run_for_revolutions(ser, target_rpm, num_revolutions, direction, ramp_step=5
     while actual_rpm == 0 and attempts < 5:
         actual_rpm = read_actual_rpm(ser)
         if actual_rpm is None:
-            print("⚠️ Error: Couldn't read actual RPM. Retrying...")
+            log.warning("Couldn't read actual RPM. Retrying...")
         time.sleep(0.2)
         attempts += 1
 
     if actual_rpm == 0:
-        print("🚨 Motor did not start. Stopping function.")
+        log.error("Motor did not start. Stopping function.")
         stop_motor_natural(ser)
         return  
 
@@ -187,7 +193,7 @@ def run_for_revolutions(ser, target_rpm, num_revolutions, direction, ramp_step=5
     time_per_rev = 60 / actual_rpm  
     total_time = num_revolutions * time_per_rev
 
-    print(f"🔄 Running for {num_revolutions} revolutions (~{total_time:.2f} seconds)...")
+    log.info(f"Running for {num_revolutions} revolutions (~{total_time:.2f} seconds)...")
 
     # ⏳ **Wait while monitoring RPM**
     elapsed_time = 0
@@ -195,11 +201,11 @@ def run_for_revolutions(ser, target_rpm, num_revolutions, direction, ramp_step=5
         time.sleep(0.1)
         actual_rpm = read_actual_rpm(ser)  # Keep reading real-time RPM
         if actual_rpm is None:
-            print("⚠️ Warning: Lost RPM reading. Stopping for safety.")
+            log.warning("Lost RPM reading. Stopping for safety.")
             break
         elapsed_time += 0.1  # Increment elapsed time
 
-    print(f"✅ Target reached: {num_revolutions} revolutions completed!")
+    log.info(f"Target reached: {num_revolutions} revolutions completed!")
     stop_motor_natural(ser)
     return 0
     # 🔽 **Ramp Down to Stop Smoothly**
@@ -209,7 +215,7 @@ def run_for_revolutions(ser, target_rpm, num_revolutions, direction, ramp_step=5
         time.sleep(ramp_delay)
 
     stop_motor_natural(ser)
-    print("🛑 Motor stopped.")
+    log.info("Motor stopped.")
 
 ## ------------------------------------- Function to read start torque and sensorless start speed
 def read_start_torque_sensorless_speed(ser):
@@ -218,7 +224,7 @@ def read_start_torque_sensorless_speed(ser):
         # Decode the response
         start_torque = response[3]  # First byte: start torque
         sensorless_speed = response[4]  # Second byte: sensorless start speed
-        print(f"Start Torque: {start_torque}, Sensorless Start Speed: {sensorless_speed}")
+        log.info(f"Start Torque: {start_torque}, Sensorless Start Speed: {sensorless_speed}")
         return start_torque, sensorless_speed
     return None, None
 
@@ -229,7 +235,7 @@ def read_accel_decel_time(ser):
         # Decode the response
         accel_time = response[3]  # First byte: acceleration time
         decel_time = response[4]  # Second byte: deceleration time
-        print(f"Acceleration Time: {accel_time}, Deceleration Time: {decel_time}")
+        log.info(f"Acceleration Time: {accel_time}, Deceleration Time: {decel_time}")
         return accel_time, decel_time
     return None, None
 
@@ -245,7 +251,7 @@ def read_alarms(ser):
     if response:
         # Decode the response
         alarms = response[3]  # First byte: fault state
-        print(f"Alarms: {alarms}")
+        log.info(f"Alarms: {alarms}")
         return alarms
     return None
 
@@ -257,19 +263,50 @@ def adjust_rpm(ser, target_rpm, max_attempts=5):
     for _ in range(max_attempts):
         actual_rpm = read_actual_rpm(ser)
         if actual_rpm is None:
-            print("Error: Couldn't read actual RPM.")
+            log.error("Couldn't read actual RPM.")
             return
         
         error = target_rpm - actual_rpm
         if abs(error) < 20:  # If within 10 RPM, stop adjusting
-            print(f"RPM stabilized at {actual_rpm:.2f} RPM.")
+            log.info(f"RPM stabilized at {actual_rpm:.2f} RPM.")
             return
 
         new_rpm = int(target_rpm + (error * 0.1))  # Apply correction (small step)
         write_rpm(ser, new_rpm)
         time.sleep(0.5)  # Wait and read again
 
-    print("Max adjustment attempts reached. Final RPM:", read_actual_rpm(ser))
+    log.warning(f"Max adjustment attempts reached. Final RPM: {read_actual_rpm(ser)}")
+
+
+class MotorBus:
+    """Simple driver wrapper that owns the serial connection."""
+
+    def __init__(self, port: str | None = None, baudrate: int | None = None):
+        port = port or SERIAL_PORT
+        baudrate = baudrate or BAUD_RATE
+        self.ser = serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            parity=PARITY,
+            stopbits=STOP_BITS,
+            bytesize=BYTE_SIZE,
+            timeout=TIMEOUT,
+        )
+
+    def write_rpm(self, rpm: int):
+        return write_rpm(self.ser, rpm)
+
+    def start(self, direction: str):
+        return start_motorFR(self.ser, direction)
+
+    def stop(self):
+        return stop_motor_natural(self.ser)
+
+    def close(self):
+        try:
+            self.ser.close()
+        except Exception:
+            pass
 
 
 
@@ -346,7 +383,7 @@ def main():
 
     except KeyboardInterrupt:
         # Stop the motor on Ctrl+C
-        print("\nStopping motor...")
+        log.info("Stopping motor...")
         stop_motor_natural(ser)
 
     finally:

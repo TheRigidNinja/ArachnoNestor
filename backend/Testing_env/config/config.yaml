@@ -1,0 +1,22 @@
+evb:
+  host: "192.168.2.123"
+  port: 5000
+  timeout: 1.0
+
+motion:
+  hall_threshold: 1500
+  poll_interval: 0.02
+  stale_timeout: 0.5
+  winch_ids: [1, 2, 3, 4]
+  serial_port: "/dev/ttyUSB0"
+  baud_rate: 9600
+  device_address: 1
+
+web:
+  host: "0.0.0.0"
+  port: 8080
+
+imu_json:
+  host: "192.168.2.123"
+  port: 5000
+  timeout: 5.0
