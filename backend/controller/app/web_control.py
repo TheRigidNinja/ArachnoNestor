@@ -102,19 +102,25 @@ def index():
       </div>
       <div class="col-lg-4">
         <div class="card shadow-sm">
-          <div class="card-header">Setup Jog (requires SETUP mode)</div>
+          <div class="card-header">Setup Hall Run (requires SETUP mode)</div>
           <div class="card-body">
             <div class="row g-2 mb-2">
               <div class="col-6">
                 <label class="form-label">RPM</label>
-                <input id="jog-rpm" type="number" class="form-control" value="200">
+                <input id="setup-rpm" type="number" class="form-control" value="200">
               </div>
               <div class="col-6">
-                <label class="form-label">Seconds</label>
-                <input id="jog-sec" type="number" step="0.1" class="form-control" value="1.0">
+                <label class="form-label">Max Seconds</label>
+                <input id="setup-sec" type="number" step="0.1" class="form-control" value="0">
               </div>
             </div>
-            <button class="btn btn-primary w-100" onclick="post('/setup/jog', {rpm:getVal('jog-rpm'), seconds:getVal('jog-sec')})">Run Jog</button>
+            <div class="btn-group w-100 mb-2" role="group" aria-label="Setup direction">
+              <input type="radio" class="btn-check" name="setup-dir" id="setup-dir-fwd" autocomplete="off" checked>
+              <label class="btn btn-outline-dark" for="setup-dir-fwd">Forward</label>
+              <input type="radio" class="btn-check" name="setup-dir" id="setup-dir-rev" autocomplete="off">
+              <label class="btn btn-outline-dark" for="setup-dir-rev">Reverse</label>
+            </div>
+            <button class="btn btn-primary w-100" onclick="post('/setup/hall', {rpm:getVal('setup-rpm'), seconds:getVal('setup-sec'), direction:getSetupDir()})">Run Hall</button>
           </div>
         </div>
         <div class="card shadow-sm">
@@ -189,6 +195,7 @@ async function post(url, data) {
 }
 function getVal(id){ return parseFloat(document.getElementById(id).value) || 0; }
 function dir(name){ post(`/test/dir/${name}`, {rpm:getVal('dir-rpm'), seconds:getVal('dir-sec')}); }
+function getSetupDir(){ return document.getElementById('setup-dir-rev').checked ? 'reverse' : 'forward'; }
 function renderStatus(js){
   document.getElementById('status-json').textContent = JSON.stringify(js, null, 2);
   if (js.ok === false) {
@@ -318,6 +325,20 @@ def setup_jog():
     try:
         log.info(f"UI: setup jog rpm={rpm} sec={seconds}")
         label = mc.setup_jog(rpm=rpm, seconds=seconds)
+        return ok({"job": label})
+    except Exception as exc:
+        return err(str(exc))
+
+
+@app.post("/setup/hall")
+def setup_hall():
+    payload = request.get_json(force=True, silent=True) or {}
+    rpm = int(payload.get("rpm", 200))
+    seconds = float(payload.get("seconds", 0.0))
+    direction = str(payload.get("direction", "forward"))
+    try:
+        log.info(f"UI: setup hall rpm={rpm} sec={seconds} dir={direction}")
+        label = mc.setup_hall_run(rpm=rpm, seconds=seconds, direction=direction)
         return ok({"job": label})
     except Exception as exc:
         return err(str(exc))

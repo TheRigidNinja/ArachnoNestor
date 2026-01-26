@@ -39,6 +39,12 @@ DIRECTION_MAP = {
     "down":    [-1, -1, -1, -1],
 }
 
+# Setup mode uses a simple forward/reverse axis.
+SETUP_DIR_MAP = {
+    "forward": DIRECTION_MAP["up"],
+    "reverse": DIRECTION_MAP["down"],
+}
+
 
 class MotionController:
     def __init__(self,
@@ -74,6 +80,7 @@ class MotionController:
 
         # Currently running motion job
         self._job_thread: Optional[threading.Thread] = None
+        self._setup_hall_active = False
 
         # Track last command per motor to avoid spamming Modbus
         self._motor_state = {w: {"running": False, "rpm": 0, "dir": None} for w in WINCH_IDS}
@@ -132,6 +139,21 @@ class MotionController:
         with self._lock:
             self._ensure_ready("SETUP")
         return self._start_job(targets=DIRECTION_MAP["up"], rpm=rpm, seconds=seconds, label="setup_jog")
+
+    def setup_hall_run(self, rpm: int = 200, seconds: float = 0.0, direction: str = "forward") -> str:
+        direction = direction.lower()
+        if direction not in SETUP_DIR_MAP:
+            raise ValueError("invalid direction")
+        max_seconds = float(seconds) if seconds and seconds > 0 else None
+        with self._lock:
+            self._ensure_ready("SETUP")
+            self._setup_hall_active = True
+        return self._start_hall_job(
+            targets=SETUP_DIR_MAP[direction],
+            rpm=rpm,
+            max_seconds=max_seconds,
+            label=f"setup_hall_{direction}",
+        )
 
     def test_up(self, rpm: int = 350, seconds: float = 10.0) -> str:
         with self._lock:
@@ -230,6 +252,13 @@ class MotionController:
         job.start()
         return label
 
+    def _start_hall_job(self, targets: List[int], rpm: int, max_seconds: Optional[float], label: str) -> str:
+        job = threading.Thread(target=self._run_hall_job, args=(targets, rpm, max_seconds, label), daemon=True)
+        self._job_thread = job
+        log.info(f"Hall job start: {label} rpm={rpm} max_sec={max_seconds}")
+        job.start()
+        return label
+
     def _run_job(self, targets: List[int], rpm: int, seconds: float, label: str):
         try:
             self._command_motors(targets, rpm)
@@ -242,10 +271,42 @@ class MotionController:
             with self._lock:
                 self._job_thread = None
 
+    def _run_hall_job(self, targets: List[int], rpm: int, max_seconds: Optional[float], label: str):
+        start = time.time()
+        try:
+            while True:
+                with self._lock:
+                    status = self._safety.evaluate(self.last_halls, self.last_update)
+                    if not status.can_move:
+                        if status.reason and status.reason.startswith("hall below"):
+                            log.info(f"Hall stop: {status.reason}")
+                            break
+                        self.fault = status.reason
+                        self.mode = "FAULT"
+                        self._stop_motors_locked("safety stop")
+                        return
+
+                self._command_motors(targets, rpm)
+                if max_seconds is not None and (time.time() - start) >= max_seconds:
+                    break
+                time.sleep(POLL_INTERVAL)
+        except Exception as exc:  # safety: any failure → fault
+            self.stop_all(f"job error {label}: {exc}", as_fault=True)
+            return
+        finally:
+            self._stop_motors("hall job finished")
+            with self._lock:
+                self._job_thread = None
+                self._setup_hall_active = False
+
     def _command_motors(self, targets: List[int], rpm: int):
         with self._lock:
             status = self._safety.evaluate(self.last_halls, self.last_update)
             if not status.can_move:
+                if self._setup_hall_active and status.reason and status.reason.startswith("hall below"):
+                    log.info(f"Setup hall stop: {status.reason}")
+                    self._stop_motors_locked("hall below threshold")
+                    return
                 self.fault = status.reason
                 self.mode = "FAULT"
                 log.warning(f"Motion blocked: {status.reason}")
@@ -268,8 +329,6 @@ class MotionController:
 
     def _stop_motor(self, motor_id: int):
         state = self._motor_state[motor_id]
-
-        print(  f"Stopping motor {self._motor_state[motor_id]}...")  # Debug print
         if not state["running"]:
             return
         try:
@@ -336,9 +395,12 @@ class MotionController:
                             self.last_update = now
                             status = self._safety.evaluate(self.last_halls, self.last_update)
                             if not status.can_move:
-                                self.fault = status.reason
-                                self.mode = "FAULT"
-                                self._stop_motors_locked("safety stop")
+                                if self._setup_hall_active and status.reason and status.reason.startswith("hall below"):
+                                    self._stop_motors_locked("hall below threshold")
+                                else:
+                                    self.fault = status.reason
+                                    self.mode = "FAULT"
+                                    self._stop_motors_locked("safety stop")
 
                         elapsed = time.time() - cycle_start
                         sleep_for = max(0.0, POLL_INTERVAL - elapsed)
