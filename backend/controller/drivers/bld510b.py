@@ -76,6 +76,7 @@ def start_motorFR(ser, FR):
 
 ## ------------------------------------- Function to stop the motor (natural stop)
 def stop_motor_natural(ser):
+    print("Stopping motor naturally...")
     send_modbus_command(ser, 0x06, 0x8000, 0x0802)
 
 ## -------------------------------------  Function to stop the motor (braking stop)

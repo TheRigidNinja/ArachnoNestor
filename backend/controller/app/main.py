@@ -70,5 +70,10 @@ def main(argv=None):
     from app.web_control import main as web_main
     return web_main() or 0
 
+# Thin wrapper for root launcher
+def run(argv=None):
+    return main(argv)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

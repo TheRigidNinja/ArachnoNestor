@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Minimal Flask web UI for supervisor control."""
 
-from flask import Flask, jsonify, request
+import json
+import time
+
+from flask import Flask, Response, jsonify, request
 
 from config.settings import load_config
 from motor.motion_controller import get_controller, DIRECTION_MAP
@@ -31,6 +34,23 @@ def status():
     except Exception as exc:
         log.error(f"/status error: {exc}")
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.get("/events")
+def events():
+    def stream():
+        last_sent = 0.0
+        while True:
+            try:
+                data = mc.get_status()
+                payload = json.dumps(data)
+                yield f"data: {payload}\n\n"
+                last_sent = time.time()
+            except Exception as exc:
+                log.error(f"/events error: {exc}")
+                yield f"data: {json.dumps({'ok': False, 'error': str(exc)})}\n\n"
+            time.sleep(0.02)
+    return Response(stream(), mimetype="text/event-stream")
 
 
 @app.get("/")
@@ -169,57 +189,63 @@ async function post(url, data) {
 }
 function getVal(id){ return parseFloat(document.getElementById(id).value) || 0; }
 function dir(name){ post(`/test/dir/${name}`, {rpm:getVal('dir-rpm'), seconds:getVal('dir-sec')}); }
-async function refreshStatus(){
-  try {
-    const res = await fetch('/status');
-    const js = await res.json();
-    document.getElementById('status-json').textContent = JSON.stringify(js, null, 2);
-    if (js.ok === false) {
-      document.getElementById('status-text').textContent = `Status error: ${js.error || 'unknown'}`;
-      return;
-    }
-    document.getElementById('status-text').textContent = `Mode: ${js.mode} | Fault: ${js.fault || 'none'} | Last update: ${fmtTime(js.last_update)}`;
+function renderStatus(js){
+  document.getElementById('status-json').textContent = JSON.stringify(js, null, 2);
+  if (js.ok === false) {
+    document.getElementById('status-text').textContent = `Status error: ${js.error || 'unknown'}`;
+    return;
+  }
+  document.getElementById('status-text').textContent = `Mode: ${js.mode} | Fault: ${js.fault || 'none'} | Last update: ${fmtTime(js.last_update)}`;
 
-    document.getElementById('mode-idle').checked = (js.mode === 'IDLE');
-    document.getElementById('mode-setup').checked = (js.mode === 'SETUP');
-    document.getElementById('mode-test').checked = (js.mode === 'TEST');
+  document.getElementById('mode-idle').checked = (js.mode === 'IDLE');
+  document.getElementById('mode-setup').checked = (js.mode === 'SETUP');
+  document.getElementById('mode-test').checked = (js.mode === 'TEST');
 
-    const halls = js.halls || {};
-    let hallsHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Hall</th></tr></thead><tbody>';
-    for (const [k,v] of Object.entries(halls)) { hallsHtml += `<tr><td>${k}</td><td>${v}</td></tr>`; }
-    hallsHtml += '</tbody></table>';
-    document.getElementById('halls-table').innerHTML = '<strong>Hall</strong>' + hallsHtml;
+  const halls = js.halls || {};
+  let hallsHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Hall</th></tr></thead><tbody>';
+  for (const [k,v] of Object.entries(halls)) { hallsHtml += `<tr><td>${k}</td><td>${v}</td></tr>`; }
+  hallsHtml += '</tbody></table>';
+  document.getElementById('halls-table').innerHTML = '<strong>Hall</strong>' + hallsHtml;
 
-    const power = js.power || {};
-    let pHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Bus (mV)</th><th>Current (mA)</th><th>Power (mW)</th></tr></thead><tbody>';
-    for (const [k,v] of Object.entries(power)) { pHtml += `<tr><td>${k}</td><td>${v.bus_mv}</td><td>${v.current_ma}</td><td>${v.power_mw}</td></tr>`; }
-    pHtml += '</tbody></table>';
-    document.getElementById('power-table').innerHTML = '<strong>Power</strong>' + pHtml;
+  const power = js.power || {};
+  let pHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Bus (mV)</th><th>Current (mA)</th><th>Power (mW)</th></tr></thead><tbody>';
+  for (const [k,v] of Object.entries(power)) { pHtml += `<tr><td>${k}</td><td>${v.bus_mv}</td><td>${v.current_ma}</td><td>${v.power_mw}</td></tr>`; }
+  pHtml += '</tbody></table>';
+  document.getElementById('power-table').innerHTML = '<strong>Power</strong>' + pHtml;
 
-    const bundles = js.bundles || {};
-    let bHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Total</th><th>Delta</th><th>Hall</th><th>Dist(mm)</th><th>Strength</th><th>TempRaw</th><th>Age(ms)</th></tr></thead><tbody>';
-    for (const [k,v] of Object.entries(bundles)) {
-      bHtml += `<tr><td>${k}</td><td>${v.total_count ?? ''}</td><td>${v.delta_count ?? ''}</td><td>${v.hall_raw ?? ''}</td><td>${v.dist_mm ?? ''}</td><td>${v.strength ?? ''}</td><td>${v.temp_raw ?? ''}</td><td>${v.age_ms ?? ''}</td></tr>`;
-    }
-    bHtml += '</tbody></table>';
-    document.getElementById('bundle-table').innerHTML = '<strong>Winch Sensors</strong>' + bHtml;
+  const bundles = js.bundles || {};
+  let bHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Total</th><th>Delta</th><th>Hall</th><th>Dist(mm)</th><th>Strength</th><th>TempRaw</th><th>Age(ms)</th></tr></thead><tbody>';
+  for (const [k,v] of Object.entries(bundles)) {
+    bHtml += `<tr><td>${k}</td><td>${v.total_count ?? ''}</td><td>${v.delta_count ?? ''}</td><td>${v.hall_raw ?? ''}</td><td>${v.dist_mm ?? ''}</td><td>${v.strength ?? ''}</td><td>${v.temp_raw ?? ''}</td><td>${v.age_ms ?? ''}</td></tr>`;
+  }
+  bHtml += '</tbody></table>';
+  document.getElementById('bundle-table').innerHTML = '<strong>Winch Sensors</strong>' + bHtml;
 
-    if (js.imu) {
-      const i = js.imu;
-      const imuTxt = `Gyro: (${i.gyro[0].toFixed(2)}, ${i.gyro[1].toFixed(2)}, ${i.gyro[2].toFixed(2)}) | ` +
-        `Accel: (${i.accel[0].toFixed(2)}, ${i.accel[1].toFixed(2)}, ${i.accel[2].toFixed(2)}) | ` +
-        `Pitch: ${i.pitch.toFixed(2)} Roll: ${i.roll.toFixed(2)} Yaw: ${i.yaw.toFixed(2)} | Temp: ${i.temp_c.toFixed(1)}C`;
-      document.getElementById('imu-box').innerHTML = '<strong>IMU</strong><div class="small">' + imuTxt + '</div>';
-    } else {
-      document.getElementById('imu-box').innerHTML = '<strong>IMU</strong><div class="small text-muted">(no data yet)</div>';
-    }
-  } catch(e){
-    document.getElementById('status-text').textContent = 'Status fetch failed';
+  if (js.imu) {
+    const i = js.imu;
+    const imuTxt = `Gyro: (${i.gyro[0].toFixed(2)}, ${i.gyro[1].toFixed(2)}, ${i.gyro[2].toFixed(2)}) | ` +
+      `Accel: (${i.accel[0].toFixed(2)}, ${i.accel[1].toFixed(2)}, ${i.accel[2].toFixed(2)}) | ` +
+      `Pitch: ${i.pitch.toFixed(2)} Roll: ${i.roll.toFixed(2)} Yaw: ${i.yaw.toFixed(2)} | Temp: ${i.temp_c.toFixed(1)}C`;
+    document.getElementById('imu-box').innerHTML = '<strong>IMU</strong><div class="small">' + imuTxt + '</div>';
+  } else {
+    document.getElementById('imu-box').innerHTML = '<strong>IMU</strong><div class="small text-muted">(no data yet)</div>';
   }
 }
+
+function connectSSE(){
+  const es = new EventSource('/events');
+  es.onmessage = (evt) => {
+    try {
+      const js = JSON.parse(evt.data);
+      renderStatus(js);
+    } catch(e) {}
+  };
+  es.onerror = () => {
+    document.getElementById('status-text').textContent = 'Status stream disconnected';
+  };
+}
 function fmtTime(t){ if(!t) return 'n/a'; const d=new Date(t*1000); return d.toLocaleTimeString(); }
-refreshStatus();
-setInterval(refreshStatus, 1500);
+connectSSE();
 </script>
 
 </body>

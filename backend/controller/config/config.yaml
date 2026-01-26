@@ -5,7 +5,7 @@ evb:
 
 motion:
   hall_threshold: 1500
-  poll_interval: 0.02
+  poll_interval: 0.1
   stale_timeout: 0.5
   winch_ids: [1, 2, 3, 4]
   serial_port: "/dev/ttyUSB0"

@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import json
-import socket
 from dataclasses import dataclass
 
 from config.settings import load_config
 from logutil.logger import get_logger
+from tcp.line_client import LineClient
 
 CONFIG = load_config()
 log = get_logger("drivers.imu_driver")
@@ -37,22 +37,13 @@ class IMUReading:
 
 class ESP32IMUClient:
     def __init__(self, host=ESP_IP, port=ESP_PORT, timeout=TIMEOUT_SEC):
-        self.addr = (host, port)
-        self.timeout = timeout
-        self.sock = None
-        self.fd = None
+        self.client = LineClient(host, port, timeout, nonblocking=False)
 
     def connect(self):
-        self.sock = socket.create_connection(self.addr, self.timeout)
-        self.fd = self.sock.makefile("r")
+        self.client.connect()
 
     def close(self):
-        if self.fd:
-            self.fd.close()
-            self.fd = None
-        if self.sock:
-            self.sock.close()
-            self.sock = None
+        self.client.close()
 
     def __enter__(self):
         self.connect()
@@ -64,7 +55,7 @@ class ESP32IMUClient:
     def stream(self):
         """Yield IMUReading for each JSON line."""
         while True:
-            line = self.fd.readline()
+            line = self.client.readline()
             if not line:
                 raise ConnectionError("ESP32 closed connection")
             try:

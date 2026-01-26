@@ -1,6 +1,6 @@
 """Inspection mode logic (placeholder)."""
 
-from motor.motion_controller import MotionController
+from motor import MotionController
 
 
 def run(controller: MotionController):

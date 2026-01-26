@@ -29,3 +29,6 @@
 9) New capabilities should be added as importable modules, then wired in `app/main.py`.
 
 10) Any change that can move hardware must include a safety check + test.
+
+No module may directly control hardware unless it is explicitly designated
+as a driver or the motion controller. Violations are bugs, not features.
