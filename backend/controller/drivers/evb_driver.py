@@ -23,6 +23,7 @@ class Bundle:
     bus_mv: int
     current_ma: int
     power_mw: int
+    cache_age_ms: int | None
 
 
 @dataclass
@@ -40,6 +41,8 @@ class Imu:
     pitch: float
     roll: float
     yaw: float
+    cache_age_ms: int | None
+    seq: int | None
 
 
 def get_bundle(cli: EvbClient, winch_id: int) -> Bundle:
@@ -57,6 +60,7 @@ def get_bundle(cli: EvbClient, winch_id: int) -> Bundle:
         bus_mv=b["bus_mv"],
         current_ma=b["current_ma"],
         power_mw=b["power_mw"],
+        cache_age_ms=b.get("cache_age_ms"),
     )
 
 
@@ -78,6 +82,8 @@ def get_imu(cli: EvbClient) -> Imu:
         pitch=i["pitch"],
         roll=i["roll"],
         yaw=i["yaw"],
+        cache_age_ms=i.get("cache_age_ms"),
+        seq=i.get("seq"),
     )
 
 
