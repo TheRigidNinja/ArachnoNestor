@@ -40,12 +40,22 @@ def status():
 def events():
     def stream():
         last_sent = 0.0
+        last_payload = None
+        min_interval = 0.1
+        heartbeat = 1.0
         while True:
             try:
                 data = mc.get_status()
-                payload = json.dumps(data)
-                yield f"data: {payload}\n\n"
-                last_sent = time.time()
+                payload = json.dumps(data, sort_keys=True)
+                now = time.time()
+                changed = payload != last_payload
+                if changed and (now - last_sent) >= min_interval:
+                    yield f"data: {payload}\n\n"
+                    last_payload = payload
+                    last_sent = now
+                elif (now - last_sent) >= heartbeat:
+                    yield f"data: {payload}\n\n"
+                    last_sent = now
             except Exception as exc:
                 log.error(f"/events error: {exc}")
                 yield f"data: {json.dumps({'ok': False, 'error': str(exc)})}\n\n"

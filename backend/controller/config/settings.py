@@ -12,8 +12,8 @@ DEFAULTS: Dict[str, Any] = {
     "evb": {"host": "192.168.2.123", "port": 5000, "timeout": 2.0},
     "motion": {
         "hall_threshold": 1500,
-        "poll_interval": 0.05,
-        "stale_timeout": 1.5,
+        "poll_interval": 0.1,
+        "stale_timeout": 1.0,
         "evb_backoff_initial": 0.2,
         "evb_backoff_max": 2.0,
         "evb_backoff_factor": 1.5,
