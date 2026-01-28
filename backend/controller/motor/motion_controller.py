@@ -269,7 +269,7 @@ class MotionController:
     def _stop_motor(self, motor_id: int):
         state = self._motor_state[motor_id]
 
-        print(  f"Stopping motor {self._motor_state[motor_id]}...")  # Debug print
+        # print(  f"Stopping motor {self._motor_state[motor_id]}...")  # Debug print
         if not state["running"]:
             return
         try:
