@@ -9,11 +9,17 @@ from typing import Any, Dict
 
 
 DEFAULTS: Dict[str, Any] = {
-    "evb": {"host": "192.168.2.123", "port": 5000, "timeout": 1.0},
+    "evb": {"host": "192.168.2.123", "port": 5000, "timeout": 2.0},
     "motion": {
         "hall_threshold": 1500,
-        "poll_interval": 0.02,
-        "stale_timeout": 0.5,
+        "poll_interval": 0.05,
+        "stale_timeout": 1.5,
+        "evb_backoff_initial": 0.2,
+        "evb_backoff_max": 2.0,
+        "evb_backoff_factor": 1.5,
+        "use_bundle": True,
+        "use_power": True,
+        "use_imu": True,
         "winch_ids": [1, 2, 3, 4],
         "serial_port": "/dev/ttyUSB0",
         "baud_rate": 9600,

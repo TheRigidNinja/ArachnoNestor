@@ -32,6 +32,7 @@ class TestMotionController(MotionController):
         self._motor_state = {w: {"running": False, "rpm": 0, "dir": None} for w in WINCH_IDS}
         self._safety = SafetyMonitor(hall_threshold=HALL_THRESHOLD, stale_timeout_s=STALE_TIMEOUT)
         self._setup_hall_active = setup_active
+        self._allow_hall_below = False
 
 
 class TestSetupHall(unittest.TestCase):
@@ -46,8 +47,22 @@ class TestSetupHall(unittest.TestCase):
         halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc._command_motors(DIRECTION_MAP["up"], rpm=200)
-        self.assertIsNotNone(mc.fault)
-        self.assertEqual(mc.mode, "FAULT")
+        self.assertIsNone(mc.fault)
+        self.assertNotEqual(mc.mode, "FAULT")
+
+    def test_directional_tests_blocked_when_hall_low(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "TEST"
+        with self.assertRaises(RuntimeError):
+            mc.test_direction("forward", rpm=200, seconds=1.0)
+
+    def test_allow_hall_below_does_not_fault(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc._allow_hall_below = True
+        mc._command_motors(DIRECTION_MAP["up"], rpm=200)
+        self.assertIsNone(mc.fault)
 
 
 if __name__ == "__main__":

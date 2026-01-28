@@ -69,6 +69,17 @@ def index():
     .card + .card { margin-top: 1rem; }
     .btn-group .btn { min-width: 90px; }
     pre { background: #111; color: #0f0; padding: 0.75rem; border-radius: 6px; }
+    .invert-active .btn-check:checked + .btn,
+    .invert-active .btn.active {
+      background-color: var(--bs-btn-active-bg);
+      border-color: var(--bs-btn-active-border-color);
+      color: var(--bs-btn-active-color);
+    }
+    .invert-active .btn-check:focus + .btn,
+    .invert-active .btn:focus {
+      box-shadow: 0 0 0 0.2rem rgba(0,0,0,0.25);
+    }
+    label.disabled { opacity: 0.5; }
   </style>
 </head>
 <body>
@@ -79,11 +90,11 @@ def index():
         <div class="card shadow-sm">
           <div class="card-header">Mode</div>
           <div class="card-body d-grid gap-2">
-            <div class="btn-group" role="group" aria-label="Mode toggle">
+            <div class="btn-group invert-active" role="group" aria-label="Mode toggle">
               <input type="radio" class="btn-check" name="mode" id="mode-idle" autocomplete="off" onclick="post('/mode/idle')">
               <label class="btn btn-outline-secondary" for="mode-idle">IDLE</label>
 
-              <input type="radio" class="btn-check" name="mode" id="mode-setup" autocomplete="off" onclick="post('/mode/setup')">
+              <input type="radio" class="btn-check" name="mode" id="mode-setup" autocomplete="off" onclick="setMode('setup')">
               <label class="btn btn-outline-primary" for="mode-setup">SETUP</label>
 
               <input type="radio" class="btn-check" name="mode" id="mode-test" autocomplete="off" onclick="post('/mode/test')">
@@ -114,7 +125,7 @@ def index():
                 <input id="setup-sec" type="number" step="0.1" class="form-control" value="0">
               </div>
             </div>
-            <div class="btn-group w-100 mb-2" role="group" aria-label="Setup direction">
+            <div class="btn-group w-100 mb-2 invert-active" role="group" aria-label="Setup direction">
               <input type="radio" class="btn-check" name="setup-dir" id="setup-dir-fwd" autocomplete="off" checked>
               <label class="btn btn-outline-dark" for="setup-dir-fwd">Forward</label>
               <input type="radio" class="btn-check" name="setup-dir" id="setup-dir-rev" autocomplete="off">
@@ -136,7 +147,7 @@ def index():
                 <input id="up-sec" type="number" step="0.1" class="form-control" value="10">
               </div>
             </div>
-            <button class="btn btn-success w-100" onclick="post('/test/up', {rpm:getVal('up-rpm'), seconds:getVal('up-sec')})">Start UP Test</button>
+            <button id="up-test-btn" class="btn btn-success w-100" onclick="post('/test/up', {rpm:getVal('up-rpm'), seconds:getVal('up-sec')})">Start UP Test</button>
           </div>
         </div>
       </div>
@@ -154,17 +165,23 @@ def index():
                 <input id="dir-sec" type="number" step="0.1" class="form-control" value="6">
               </div>
             </div>
-            <div class="btn-group w-100" role="group">
-              <button class="btn btn-outline-dark" onclick="dir('forward')">Forward</button>
-              <button class="btn btn-outline-dark" onclick="dir('back')">Back</button>
+            <div class="btn-group w-100 invert-active" role="group" aria-label="Directional test row 1">
+              <input type="radio" class="btn-check" name="dir-test" id="dir-forward" autocomplete="off" onclick="dir('forward')">
+              <label class="btn btn-outline-dark" for="dir-forward">Forward</label>
+              <input type="radio" class="btn-check" name="dir-test" id="dir-back" autocomplete="off" onclick="dir('back')">
+              <label class="btn btn-outline-dark" for="dir-back">Back</label>
             </div>
-            <div class="btn-group w-100 mt-2" role="group">
-              <button class="btn btn-outline-dark" onclick="dir('left')">Left</button>
-              <button class="btn btn-outline-dark" onclick="dir('right')">Right</button>
+            <div class="btn-group w-100 mt-2 invert-active" role="group" aria-label="Directional test row 2">
+              <input type="radio" class="btn-check" name="dir-test" id="dir-left" autocomplete="off" onclick="dir('left')">
+              <label class="btn btn-outline-dark" for="dir-left">Left</label>
+              <input type="radio" class="btn-check" name="dir-test" id="dir-right" autocomplete="off" onclick="dir('right')">
+              <label class="btn btn-outline-dark" for="dir-right">Right</label>
             </div>
-            <div class="btn-group w-100 mt-2" role="group">
-              <button class="btn btn-outline-dark" onclick="dir('up')">Up</button>
-              <button class="btn btn-outline-dark" onclick="dir('down')">Down</button>
+            <div class="btn-group w-100 mt-2 invert-active" role="group" aria-label="Directional test row 3">
+              <input type="radio" class="btn-check" name="dir-test" id="dir-up" autocomplete="off" onclick="dir('up')">
+              <label class="btn btn-outline-dark" for="dir-up">Up</label>
+              <input type="radio" class="btn-check" name="dir-test" id="dir-down" autocomplete="off" onclick="dir('down')">
+              <label class="btn btn-outline-dark" for="dir-down">Down</label>
             </div>
           </div>
         </div>
@@ -193,9 +210,17 @@ async function post(url, data) {
   document.getElementById('status-json').textContent = JSON.stringify(js, null, 2);
   refreshStatus();
 }
+async function refreshStatus(){
+  const res = await fetch('/status');
+  const js = await res.json().catch(()=>({ok:false,error:'bad json'}));
+  renderStatus(js);
+}
 function getVal(id){ return parseFloat(document.getElementById(id).value) || 0; }
 function dir(name){ post(`/test/dir/${name}`, {rpm:getVal('dir-rpm'), seconds:getVal('dir-sec')}); }
 function getSetupDir(){ return document.getElementById('setup-dir-rev').checked ? 'reverse' : 'forward'; }
+async function setMode(mode){
+  await post(`/mode/${mode}`);
+}
 function renderStatus(js){
   document.getElementById('status-json').textContent = JSON.stringify(js, null, 2);
   if (js.ok === false) {
@@ -207,6 +232,8 @@ function renderStatus(js){
   document.getElementById('mode-idle').checked = (js.mode === 'IDLE');
   document.getElementById('mode-setup').checked = (js.mode === 'SETUP');
   document.getElementById('mode-test').checked = (js.mode === 'TEST');
+  const upBtn = document.getElementById('up-test-btn');
+  if (upBtn) upBtn.disabled = false;
 
   const halls = js.halls || {};
   let hallsHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Hall</th></tr></thead><tbody>';
@@ -339,6 +366,8 @@ def setup_hall():
     try:
         log.info(f"UI: setup hall rpm={rpm} sec={seconds} dir={direction}")
         label = mc.setup_hall_run(rpm=rpm, seconds=seconds, direction=direction)
+
+        # log.info(f"Started setup hall job: {"label"}")
         return ok({"job": label})
     except Exception as exc:
         return err(str(exc))

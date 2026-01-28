@@ -26,6 +26,12 @@ WINCH_IDS: List[int] = CONFIG["motion"]["winch_ids"]
 HALL_THRESHOLD = CONFIG["motion"]["hall_threshold"]
 POLL_INTERVAL = CONFIG["motion"]["poll_interval"]
 STALE_TIMEOUT = CONFIG["motion"]["stale_timeout"]
+EVB_BACKOFF_INITIAL = CONFIG["motion"]["evb_backoff_initial"]
+EVB_BACKOFF_MAX = CONFIG["motion"]["evb_backoff_max"]
+EVB_BACKOFF_FACTOR = CONFIG["motion"]["evb_backoff_factor"]
+USE_BUNDLE = CONFIG["motion"].get("use_bundle", True)
+USE_POWER = CONFIG["motion"].get("use_power", True)
+USE_IMU = CONFIG["motion"].get("use_imu", True)
 
 log = get_logger("motor.motion_controller")
 
@@ -61,6 +67,7 @@ class MotionController:
         self._lock = threading.Lock()
         self.mode: str = "IDLE"
         self.fault: Optional[str] = None
+        self.setup_activated: bool = False
         self.last_halls: Dict[int, int] = {w: 0 for w in WINCH_IDS}
         self.last_power: Dict[int, Dict[str, int]] = {w: {"bus_mv": 0, "current_ma": 0, "power_mw": 0} for w in WINCH_IDS}
         self.last_bundle: Dict[int, Dict[str, int]] = {w: {} for w in WINCH_IDS}
@@ -81,6 +88,11 @@ class MotionController:
         # Currently running motion job
         self._job_thread: Optional[threading.Thread] = None
         self._setup_hall_active = False
+        self._allow_hall_below = False
+        self._evb_error_count = 0
+        self._evb_error_streak = 0
+        self._evb_last_error = None
+        self._evb_last_error_ts = None
 
         # Track last command per motor to avoid spamming Modbus
         self._motor_state = {w: {"running": False, "rpm": 0, "dir": None} for w in WINCH_IDS}
@@ -96,6 +108,11 @@ class MotionController:
             return {
                 "mode": self.mode,
                 "fault": self.fault,
+                "setup_activated": self.setup_activated,
+                "evb_error_count": self._evb_error_count,
+                "evb_error_streak": self._evb_error_streak,
+                "evb_last_error": self._evb_last_error,
+                "evb_last_error_ts": self._evb_last_error_ts,
                 "halls": halls,
                 "power": power,
                 "bundles": bundles,
@@ -109,18 +126,30 @@ class MotionController:
         mode = mode.upper()
         if mode not in {"IDLE", "SETUP", "TEST", "FAULT"}:
             raise ValueError("invalid mode")
+        should_start_setup = False
         with self._lock:
             # If already faulted, only allow clear_fault to exit
             if self.fault and mode != "FAULT":
                 raise RuntimeError("in FAULT; clear_fault first")
+            if mode == "IDLE":
+                self.setup_activated = False
             # Stop motors before switching
             self._stop_motors_locked("mode change")
             self.mode = mode
+            if mode == "SETUP":
+                self.setup_activated = True
+                should_start_setup = not (self._job_thread is not None and self._job_thread.is_alive())
+        if should_start_setup:
+            try:
+                self.setup_hall_run()
+            except Exception as exc:
+                log.warning(f"Auto setup hall run skipped: {exc}")
 
     def clear_fault(self) -> None:
         with self._lock:
             self.fault = None
             self.mode = "IDLE"
+            self.setup_activated = False
             self._stop_motors_locked("fault cleared")
 
     def stop_all(self, reason: str = "user stop", as_fault: bool = False) -> None:
@@ -144,10 +173,14 @@ class MotionController:
         direction = direction.lower()
         if direction not in SETUP_DIR_MAP:
             raise ValueError("invalid direction")
+        
         max_seconds = float(seconds) if seconds and seconds > 0 else None
+
         with self._lock:
             self._ensure_ready("SETUP")
+            log.warning("Auto")
             self._setup_hall_active = True
+
         return self._start_hall_job(
             targets=SETUP_DIR_MAP[direction],
             rpm=rpm,
@@ -158,7 +191,15 @@ class MotionController:
     def test_up(self, rpm: int = 350, seconds: float = 10.0) -> str:
         with self._lock:
             self._ensure_ready("TEST")
-        return self._start_job(targets=DIRECTION_MAP["up"], rpm=rpm, seconds=seconds, label="test_up")
+            if not self.setup_activated:
+                raise RuntimeError("setup must be activated before test")
+        return self._start_job(
+            targets=DIRECTION_MAP["up"],
+            rpm=rpm,
+            seconds=seconds,
+            label="test_up",
+            allow_hall_below=True,
+        )
 
     def test_direction(self, name: str, rpm: int = 350, seconds: float = 6.0) -> str:
         name = name.lower()
@@ -166,6 +207,9 @@ class MotionController:
             raise ValueError("invalid direction")
         with self._lock:
             self._ensure_ready("TEST")
+            status = self._safety.evaluate(self.last_halls, self.last_update)
+            if not status.can_move:
+                raise RuntimeError(f"directional tests blocked: {status.reason}")
         return self._start_job(targets=DIRECTION_MAP[name], rpm=rpm, seconds=seconds, label=f"dir_{name}")
 
     def run_balance_loop(
@@ -245,8 +289,19 @@ class MotionController:
         if self._job_thread is not None and self._job_thread.is_alive():
             raise RuntimeError("another job running")
 
-    def _start_job(self, targets: List[int], rpm: int, seconds: float, label: str) -> str:
-        job = threading.Thread(target=self._run_job, args=(targets, rpm, seconds, label), daemon=True)
+    def _start_job(
+        self,
+        targets: List[int],
+        rpm: int,
+        seconds: float,
+        label: str,
+        allow_hall_below: bool = False,
+    ) -> str:
+        job = threading.Thread(
+            target=self._run_job,
+            args=(targets, rpm, seconds, label, allow_hall_below),
+            daemon=True,
+        )
         self._job_thread = job
         log.info(f"Job start: {label} rpm={rpm} sec={seconds}")
         job.start()
@@ -259,8 +314,10 @@ class MotionController:
         job.start()
         return label
 
-    def _run_job(self, targets: List[int], rpm: int, seconds: float, label: str):
+    def _run_job(self, targets: List[int], rpm: int, seconds: float, label: str, allow_hall_below: bool):
         try:
+            with self._lock:
+                self._allow_hall_below = allow_hall_below
             self._command_motors(targets, rpm)
             time.sleep(max(0.0, seconds))
         except Exception as exc:  # safety: any failure → fault
@@ -270,21 +327,32 @@ class MotionController:
             self._stop_motors("job finished")
             with self._lock:
                 self._job_thread = None
+                self._allow_hall_below = False
 
     def _run_hall_job(self, targets: List[int], rpm: int, max_seconds: Optional[float], label: str):
         start = time.time()
+
+        log.info(f"Hall job running: {label}")
         try:
             while True:
+                wait_for_hall = False
                 with self._lock:
                     status = self._safety.evaluate(self.last_halls, self.last_update)
                     if not status.can_move:
                         if status.reason and status.reason.startswith("hall below"):
-                            log.info(f"Hall stop: {status.reason}")
-                            break
-                        self.fault = status.reason
-                        self.mode = "FAULT"
-                        self._stop_motors_locked("safety stop")
-                        return
+                            # Arm until hall is above threshold; keep motors stopped.
+                            self._stop_motors_locked("hall below threshold")
+                            wait_for_hall = True
+                        else:
+                            self.fault = status.reason
+                            self.mode = "FAULT"
+                            log.warning(f"Motion blocked: {status.reason}")
+                            self._stop_motors_locked("safety stop")
+                            return
+
+                if wait_for_hall:
+                    time.sleep(POLL_INTERVAL)
+                    continue
 
                 self._command_motors(targets, rpm)
                 if max_seconds is not None and (time.time() - start) >= max_seconds:
@@ -303,15 +371,23 @@ class MotionController:
         with self._lock:
             status = self._safety.evaluate(self.last_halls, self.last_update)
             if not status.can_move:
-                if self._setup_hall_active and status.reason and status.reason.startswith("hall below"):
-                    log.info(f"Setup hall stop: {status.reason}")
-                    self._stop_motors_locked("hall below threshold")
+                if status.reason and status.reason.startswith("hall below"):
+                    if self._allow_hall_below:
+                        pass
+                    elif self._setup_hall_active:
+                        log.info(f"Setup hall stop: {status.reason}")
+                        self._stop_motors_locked("hall below threshold")
+                        return
+                    else:
+                        log.warning(f"Motion blocked: {status.reason}")
+                        self._stop_motors_locked("hall below threshold")
+                        return
+                else:
+                    self.fault = status.reason
+                    self.mode = "FAULT"
+                    log.warning(f"Motion blocked: {status.reason}")
+                    self._stop_motors_locked("safety stop")
                     return
-                self.fault = status.reason
-                self.mode = "FAULT"
-                log.warning(f"Motion blocked: {status.reason}")
-                self._stop_motors_locked("safety stop")
-                return
         abs_rpm = max(0, int(rpm))
         for motor_id, direction in zip(WINCH_IDS, targets):
             if direction == 0:
@@ -352,9 +428,11 @@ class MotionController:
 
     # ------------- polling & safety -------------
     def _poll_loop(self):
+        backoff = EVB_BACKOFF_INITIAL
         while not self._stop_event.is_set():
             try:
                 with EVBDriver(self.host, self.port, self.timeout) as evb:
+                    had_error = False
                     while not self._stop_event.is_set():
                         cycle_start = time.time()
                         halls = {}
@@ -362,20 +440,41 @@ class MotionController:
                         bundles = {}
                         try:
                             for w in WINCH_IDS:
-                                bundle = evb.bundle(w)
-                                halls[w] = bundle.hall_raw
-                                power[w] = {
-                                    "bus_mv": bundle.bus_mv,
-                                    "current_ma": bundle.current_ma,
-                                    "power_mw": bundle.power_mw,
-                                }
-                                bundles[w] = bundle.__dict__
+                                if USE_BUNDLE:
+                                    bundle = evb.bundle(w)
+                                    halls[w] = bundle.hall_raw
+                                    if USE_POWER:
+                                        power[w] = {
+                                            "bus_mv": bundle.bus_mv,
+                                            "current_ma": bundle.current_ma,
+                                            "power_mw": bundle.power_mw,
+                                        }
+                                    bundles[w] = bundle.__dict__
+                                else:
+                                    snap = evb.snapshot(w)
+                                    halls[w] = snap.hall_raw
+                                    bundles[w] = {
+                                        "winch": snap.winch,
+                                        "total_count": snap.total_count,
+                                        "hall_raw": snap.hall_raw,
+                                    }
                             try:
-                                imu = evb.imu()
+                                imu = evb.imu() if USE_IMU else None
                             except Exception:
                                 imu = None
                         except Exception as exc:
+                            now = time.time()
+                            with self._lock:
+                                self._evb_error_count += 1
+                                self._evb_error_streak += 1
+                                self._evb_last_error = str(exc)
+                                self._evb_last_error_ts = now
+                            log.error(
+                                f"EVB read error: {exc}; backoff={backoff:.2f}s "
+                                f"(count={self._evb_error_count} streak={self._evb_error_streak})"
+                            )
                             self.stop_all(f"EVB error: {exc}", as_fault=True)
+                            had_error = True
                             break
 
                         now = time.time()
@@ -395,19 +494,47 @@ class MotionController:
                             self.last_update = now
                             status = self._safety.evaluate(self.last_halls, self.last_update)
                             if not status.can_move:
-                                if self._setup_hall_active and status.reason and status.reason.startswith("hall below"):
-                                    self._stop_motors_locked("hall below threshold")
+                                if status.reason and status.reason.startswith("hall below"):
+                                    if self._allow_hall_below:
+                                        pass
+                                    elif self._setup_hall_active:
+                                        self._stop_motors_locked("hall below threshold")
+                                    else:
+                                        self._stop_motors_locked("hall below threshold")
                                 else:
                                     self.fault = status.reason
                                     self.mode = "FAULT"
                                     self._stop_motors_locked("safety stop")
+                            log.info(
+                                f"EVB sample halls={self.last_halls} power={self.last_power} "
+                                f"imu={'ok' if self.last_imu else 'none'}"
+                            )
 
                         elapsed = time.time() - cycle_start
                         sleep_for = max(0.0, POLL_INTERVAL - elapsed)
                         time.sleep(sleep_for)
+                    if had_error:
+                        log.warning(f"EVB retrying after error; backoff={backoff:.2f}s")
+                        time.sleep(backoff)
+                        backoff = min(EVB_BACKOFF_MAX, backoff * EVB_BACKOFF_FACTOR)
+                    else:
+                        with self._lock:
+                            self._evb_error_streak = 0
+                        backoff = EVB_BACKOFF_INITIAL
             except Exception as exc:
+                now = time.time()
+                with self._lock:
+                    self._evb_error_count += 1
+                    self._evb_error_streak += 1
+                    self._evb_last_error = str(exc)
+                    self._evb_last_error_ts = now
+                log.error(
+                    f"EVB connection failure: {exc}; backoff={backoff:.2f}s "
+                    f"(count={self._evb_error_count} streak={self._evb_error_streak})"
+                )
                 self.stop_all(f"EVB connection failure: {exc}", as_fault=True)
-                time.sleep(0.2)
+                time.sleep(backoff)
+                backoff = min(EVB_BACKOFF_MAX, backoff * EVB_BACKOFF_FACTOR)
 
     def shutdown(self):
         self._stop_event.set()

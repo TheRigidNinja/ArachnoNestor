@@ -26,6 +26,13 @@ class Bundle:
 
 
 @dataclass
+class Snapshot:
+    winch: int
+    total_count: int
+    hall_raw: int
+
+
+@dataclass
 class Imu:
     gyro: tuple[float, float, float]
     accel: tuple[float, float, float]
@@ -50,6 +57,15 @@ def get_bundle(cli: EvbClient, winch_id: int) -> Bundle:
         bus_mv=b["bus_mv"],
         current_ma=b["current_ma"],
         power_mw=b["power_mw"],
+    )
+
+
+def get_snapshot(cli: EvbClient, winch_id: int) -> Snapshot:
+    r_winch, total_count, hall_raw = evb_api.get_snapshot(cli, winch_id)
+    return Snapshot(
+        winch=r_winch,
+        total_count=total_count,
+        hall_raw=hall_raw,
     )
 
 
@@ -96,6 +112,9 @@ class EVBDriver:
 
     def bundle(self, winch_id: int) -> Bundle:
         return get_bundle(self.client, winch_id)
+
+    def snapshot(self, winch_id: int) -> Snapshot:
+        return get_snapshot(self.client, winch_id)
 
     def imu(self) -> Imu:
         return get_imu(self.client)
