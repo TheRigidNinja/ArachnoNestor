@@ -1,9 +1,21 @@
 import serial
 import time
+import os
+import argparse
 from crcmod import crcmod  # Install using: pip install crcmod
 
 # RS485 configuration
-SERIAL_PORT = '/dev/ttyUSB0'  # Replace with your RS485 device
+def _pick_default_serial_port():
+    candidates = [
+        "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+        "/dev/ttyUSB0",
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[-1]
+
+SERIAL_PORT = _pick_default_serial_port()  # Replace with your RS485 device
 BAUD_RATE = 9600              # Adjust based on your motor controller settings
 PARITY = serial.PARITY_NONE   # No parity
 STOP_BITS = serial.STOPBITS_ONE  # 1 stop bit
@@ -11,7 +23,7 @@ BYTE_SIZE = serial.EIGHTBITS  # 8 data bits
 TIMEOUT = 1                   # Timeout in seconds
 
 # Modbus device address
-DEVICE_ADDRESS = 1  # Replace with your motor controller's address
+DEVICE_ADDRESS = 4  # Default Modbus slave address (override with --address or use --auto-address)
 
 # Motor configuration
 MOTOR_POLES_PAIRS = 2  # Number of poles in the motor
@@ -20,15 +32,32 @@ MOTOR_POLES_PAIRS = 2  # Number of poles in the motor
 def calculate_crc(data):
     crc16 = crcmod.mkCrcFun(0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000)
     crc_value = crc16(data)
-    return [(crc_value & 0xFF), (crc_value >> 8) & 0xFF]  # Return CRC as [LSB, MSB]
+    return bytes([(crc_value & 0xFF), (crc_value >> 8) & 0xFF])  # Return CRC as bytes [LSB, MSB]
+
+def _read_exact(ser: serial.Serial, expected_len: int) -> bytes:
+    deadline = time.monotonic() + float(ser.timeout or 0)
+    buf = bytearray()
+    while len(buf) < expected_len and time.monotonic() <= deadline:
+        chunk = ser.read(expected_len - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+def _validate_modbus_crc(frame: bytes) -> bool:
+    if len(frame) < 4:
+        return False
+    expected = calculate_crc(frame[:-2])
+    return frame[-2:] == expected
 
 ## ------------------------------------- Function to send a Modbus RTU command with CRC
-def send_modbus_command(ser, function_code, address, value=None, count=None):
+def send_modbus_command(ser, function_code, register, value=None, count=None, device_address=None, verbose=True):
     # Build the Modbus RTU frame
     frame = bytearray()
-    frame.append(DEVICE_ADDRESS)  # Slave address
+    unit = DEVICE_ADDRESS if device_address is None else int(device_address)
+    frame.append(unit)  # Slave address (unit id)
     frame.append(function_code)  # Function code
-    frame.extend(address.to_bytes(2, byteorder='big'))  # Register address
+    frame.extend(int(register).to_bytes(2, byteorder='big'))  # Register address
 
     if function_code == 0x06:  # Write single register
         frame.extend(value.to_bytes(2, byteorder='big'))  # Value to write (big-endian)
@@ -36,25 +65,40 @@ def send_modbus_command(ser, function_code, address, value=None, count=None):
         frame.extend(count.to_bytes(2, byteorder='big'))  # Number of registers to read
 
     # Calculate CRC and append to the frame
-    crc_values = calculate_crc(frame)
-    frame.extend(crc_values)
+    frame.extend(calculate_crc(frame))
 
     # Print the command in a readable format
-    spaced_string = space_hex_string(frame.hex())
-    print(f"Command sent: {spaced_string}")
+    if verbose:
+        spaced_string = space_hex_string(frame.hex())
+        print(f"Command sent: {spaced_string}")
 
     # Send the command
+    try:
+        ser.reset_input_buffer()
+    except Exception:
+        ser.flushInput()
     ser.write(frame)
+    ser.flush()
 
-    # Wait for a response (adjust the sleep time if necessary)
-    time.sleep(0.15)
-    response = ser.read_all()
-    if response:
-        print(f"Response received: {response.hex()}")
-        return response
+    if function_code == 0x06:
+        expected_len = 8
+    elif function_code == 0x03 and count is not None:
+        expected_len = 5 + (2 * count)
     else:
-        print("No response received")
+        expected_len = 256
+
+    time.sleep(0.05)
+    response = _read_exact(ser, expected_len) if expected_len != 256 else ser.read(256)
+    if not response:
+        if verbose:
+            print("No response received")
         return None
+
+    if verbose:
+        print(f"Response received: {space_hex_string(response.hex())}")
+        if not _validate_modbus_crc(response):
+            print("Warning: Response CRC check failed (possible baud/parity mismatch or line noise).")
+    return response
 
 ## ------------------------------------- Function to format a hex string with spaces
 def space_hex_string(hex_string):
@@ -269,11 +313,55 @@ def adjust_rpm(ser, target_rpm, max_attempts=5):
 
     print("Max adjustment attempts reached. Final RPM:", read_actual_rpm(ser))
 
+def _probe_address(ser, addr, register=0x8000):
+    response = send_modbus_command(ser, 0x03, register, count=1, device_address=addr, verbose=False)
+    if not response:
+        return False
+    if len(response) < 7:
+        return False
+    if response[0] != int(addr):
+        return False
+    if response[1] != 0x03:
+        return False
+    return _validate_modbus_crc(response)
+
+def scan_active_modbus_addresses(ser, *, start=1, end=247, register=0x8000, scan_timeout=0.1):
+    original_timeout = ser.timeout
+    ser.timeout = scan_timeout
+    found = []
+    try:
+        for addr in range(int(start), int(end) + 1):
+            try:
+                if _probe_address(ser, addr, register=register):
+                    found.append(addr)
+            except Exception:
+                continue
+    finally:
+        ser.timeout = original_timeout
+    return found
+
 
 
 
 ## -------------------------------------  Main function
 def main():
+    global SERIAL_PORT, BAUD_RATE, TIMEOUT, DEVICE_ADDRESS
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", default=SERIAL_PORT, help="Serial port (e.g. /dev/ttyUSB0 or /dev/serial/by-id/...)")
+    parser.add_argument("--baud", type=int, default=BAUD_RATE)
+    parser.add_argument("--address", type=int, default=DEVICE_ADDRESS, help="Modbus slave address")
+    parser.add_argument("--timeout", type=float, default=TIMEOUT)
+    parser.add_argument("--probe", action="store_true", help="Only probe by reading register 0x8000 and exit")
+    parser.add_argument("--scan", action="store_true", help="Scan bus for responding Modbus addresses and exit")
+    parser.add_argument("--auto-address", action="store_true", help="Scan bus and auto-select if exactly 1 device responds")
+    parser.add_argument("--scan-timeout", type=float, default=0.1, help="Per-address timeout used during scanning (seconds)")
+    args = parser.parse_args()
+
+    SERIAL_PORT = args.port
+    BAUD_RATE = args.baud
+    DEVICE_ADDRESS = args.address
+    TIMEOUT = args.timeout
+
     # Initialize serial port
     ser = serial.Serial(
         port=SERIAL_PORT,
@@ -285,6 +373,25 @@ def main():
     )
 
     try:
+        if args.scan or args.auto_address:
+            print("Scanning for active Modbus RTU addresses...")
+            found = scan_active_modbus_addresses(ser, scan_timeout=args.scan_timeout)
+            if not found:
+                print("No Modbus RTU devices found.")
+                return 2
+            print("Devices found at addresses:", ", ".join(str(a) for a in found))
+            if args.scan:
+                return 0
+            if len(found) != 1:
+                print("Multiple devices responded; re-run with --address <n> to pick one.")
+                return 2
+            DEVICE_ADDRESS = found[0]
+            print(f"Auto-selected Modbus address: {DEVICE_ADDRESS}")
+
+        if args.probe:
+            send_modbus_command(ser, 0x03, 0x8000, count=1)
+            return 0
+
         # write_rpm(ser, 100)
         # time.sleep(1)
         # run_for_revolutions(ser, target_rpm, num_revolutions, direction):
@@ -358,4 +465,4 @@ def main():
         ser.close()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
