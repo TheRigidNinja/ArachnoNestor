@@ -50,22 +50,22 @@ def main(argv=None):
     controller = get_controller()
 
     # Balance loop runs in background; web UI runs in main thread.
-    def _balance():
-        controller.run_balance_loop(
-            base_rpm=args.base_rpm,
-            sample_hz=args.sample_hz,
-            min_interval=args.min_interval,
-            max_interval=args.max_interval,
-            backoff=args.backoff,
-            recover=args.recover,
-            no_motors=args.no_motors,
-            host=args.host,
-            port=args.port,
-            timeout=args.timeout,
-        )
+    # def _balance():
+    #     controller.run_balance_loop(
+    #         base_rpm=args.base_rpm,
+    #         sample_hz=args.sample_hz,
+    #         min_interval=args.min_interval,
+    #         max_interval=args.max_interval,
+    #         backoff=args.backoff,
+    #         recover=args.recover,
+    #         no_motors=args.no_motors,
+    #         host=args.host,
+    #         port=args.port,
+    #         timeout=args.timeout,
+    #     )
 
-    bal_thread = threading.Thread(target=_balance, daemon=True)
-    bal_thread.start()
+    # bal_thread = threading.Thread(target=_balance, daemon=True)
+    # bal_thread.start()
 
     from app.web_control import main as web_main
     return web_main() or 0

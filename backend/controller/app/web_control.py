@@ -85,6 +85,9 @@ def index():
 <body>
   <div class="container-fluid">
     <h3 class="mb-3">Supervisor Control</h3>
+    <div class="mb-3">
+      <a class="btn btn-outline-primary btn-sm" href="/dashboard">Open Hall Dashboard</a>
+    </div>
     <div class="row g-3">
       <div class="col-lg-4">
         <div class="card shadow-sm">
@@ -116,13 +119,9 @@ def index():
           <div class="card-header">Setup Hall Run (requires SETUP mode)</div>
           <div class="card-body">
             <div class="row g-2 mb-2">
-              <div class="col-6">
-                <label class="form-label">RPM</label>
-                <input id="setup-rpm" type="number" class="form-control" value="200">
-              </div>
-              <div class="col-6">
-                <label class="form-label">Max Seconds</label>
-                <input id="setup-sec" type="number" step="0.1" class="form-control" value="0">
+              <div class="col-12">
+                <label class="form-label disabled">Max Seconds (disabled)</label>
+                <input id="setup-sec" type="number" step="0.1" class="form-control" value="0" disabled>
               </div>
             </div>
             <div class="btn-group w-100 mb-2 invert-active" role="group" aria-label="Setup direction">
@@ -131,7 +130,8 @@ def index():
               <input type="radio" class="btn-check" name="setup-dir" id="setup-dir-rev" autocomplete="off">
               <label class="btn btn-outline-dark" for="setup-dir-rev">Reverse</label>
             </div>
-            <button class="btn btn-primary w-100" onclick="post('/setup/hall', {rpm:getVal('setup-rpm'), seconds:getVal('setup-sec'), direction:getSetupDir()})">Run Hall</button>
+            <button class="btn btn-primary w-100" onclick="post('/setup/hall', {direction:getSetupDir()})">Run Hall</button>
+            <button class="btn btn-outline-secondary w-100 mt-2" onclick="post('/job/cancel', {reason:'ui cancel'})">Cancel Job</button>
           </div>
         </div>
         <div class="card shadow-sm">
@@ -189,6 +189,7 @@ def index():
           <div class="card-header">Status</div>
           <div class="card-body">
             <div id="status-text" class="mb-2 small text-muted">Loading…</div>
+            <div id="action-result" class="mb-2 small"></div>
             <div id="halls-table" class="mb-2"></div>
             <div id="power-table" class="mb-2"></div>
             <div id="bundle-table" class="mb-2"></div>
@@ -207,6 +208,16 @@ async function post(url, data) {
   if (data !== undefined) opts.body = JSON.stringify(data);
   const res = await fetch(url, opts);
   const js = await res.json().catch(()=>({ok:false,error:'bad json'}));
+  const ar = document.getElementById('action-result');
+  if (ar) {
+    if (js.ok) {
+      ar.textContent = `Last action OK: ${url}`;
+      ar.className = 'mb-2 small text-success';
+    } else {
+      ar.textContent = `Last action ERROR: ${js.error || 'unknown'}`;
+      ar.className = 'mb-2 small text-danger';
+    }
+  }
   document.getElementById('status-json').textContent = JSON.stringify(js, null, 2);
   refreshStatus();
 }
@@ -228,6 +239,20 @@ function renderStatus(js){
     return;
   }
   document.getElementById('status-text').textContent = `Mode: ${js.mode} | Fault: ${js.fault || 'none'} | Last update: ${fmtTime(js.last_update)}`;
+  const lc = js.last_command;
+  if (lc) {
+    document.getElementById('status-text').textContent += ` | Last cmd: ${lc.action} (${lc.detail}) @ ${fmtTime(parseFloat(lc.ts))}`;
+  }
+  if (js.job_label) {
+    document.getElementById('status-text').textContent += ` | Job: ${js.job_label} running=${js.job_running} gen=${js.job_gen}`;
+  }
+  if (js.poll_seq !== undefined) {
+    document.getElementById('status-text').textContent += ` | Poll: ${js.poll_seq}`;
+  }
+  if (js.max_hall_seen) {
+    const mh = js.max_hall_seen;
+    document.getElementById('status-text').textContent += ` | MaxHall: 1=${mh['1'] ?? '?'} 2=${mh['2'] ?? '?'} 3=${mh['3'] ?? '?'} 4=${mh['4'] ?? '?'}`;
+  }
 
   document.getElementById('mode-idle').checked = (js.mode === 'IDLE');
   document.getElementById('mode-setup').checked = (js.mode === 'SETUP');
@@ -288,13 +313,284 @@ connectSSE();
     )
 
 
+@app.get("/dashboard")
+def dashboard():
+    return (
+        """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hall Dashboard</title>
+  <style>
+    :root {
+      --bg-0: #0f131a;
+      --bg-1: #141a23;
+      --fg-0: #eef2f6;
+      --fg-1: #aab6c5;
+      --accent: #35c0c5;
+      --grid: rgba(255,255,255,0.08);
+    }
+    body {
+      margin: 0;
+      font-family: "SF Mono", "Fira Code", Consolas, "Liberation Mono", Menlo, monospace;
+      color: var(--fg-0);
+      background:
+        radial-gradient(1200px 600px at 10% 20%, #1a2330 0%, var(--bg-0) 55%),
+        radial-gradient(900px 500px at 90% 10%, #192431 0%, var(--bg-1) 60%);
+      min-height: 100vh;
+    }
+    header {
+      padding: 1.25rem 1.5rem 0.25rem;
+    }
+    h1 {
+      margin: 0 0 0.25rem;
+      font-size: 1.4rem;
+      letter-spacing: 0.02em;
+    }
+    .meta {
+      color: var(--fg-1);
+      font-size: 0.85rem;
+    }
+    .wrap {
+      padding: 0.75rem 1.5rem 2rem;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+    .panel {
+      background: rgba(17, 23, 33, 0.85);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 1rem;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+    }
+    .legend {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-top: 0.6rem;
+      font-size: 0.85rem;
+      color: var(--fg-1);
+    }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+      margin-right: 6px;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    .stat {
+      font-size: 0.9rem;
+      color: var(--fg-1);
+    }
+    canvas {
+      width: 100%;
+      height: 360px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.00));
+      border-radius: 12px;
+      display: block;
+    }
+    @media (max-width: 900px) {
+      .row { grid-template-columns: 1fr; }
+      canvas { height: 280px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Hall Sensor Dashboard</h1>
+    <div class="meta">
+      Live stream via SSE · <a href="/" style="color:var(--accent)">Back to Control</a>
+    </div>
+  </header>
+  <div class="wrap">
+    <div class="panel">
+      <div class="row">
+        <div class="stat" id="status-text">Connecting…</div>
+        <div class="stat" id="threshold-text"></div>
+      </div>
+      <canvas id="hall-canvas"></canvas>
+      <div class="legend" id="legend"></div>
+    </div>
+  </div>
+
+<script>
+const MAX_POINTS = 360;
+const colors = ["#35c0c5", "#f9a03f", "#6ee7b7", "#f472b6", "#60a5fa", "#facc15"];
+const series = new Map(); // winchId -> {color, points: [{t,v}]}
+let threshold = null;
+
+const canvas = document.getElementById('hall-canvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas(){
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  draw();
+}
+window.addEventListener('resize', resizeCanvas);
+
+function updateLegend(){
+  const legend = document.getElementById('legend');
+  legend.innerHTML = "";
+  for (const [winch, data] of series.entries()) {
+    const item = document.createElement('div');
+    item.innerHTML = `<span class="dot" style="background:${data.color}"></span>Winch ${winch}`;
+    legend.appendChild(item);
+  }
+}
+
+function pushPoint(winch, value, ts){
+  if (!series.has(winch)) {
+    series.set(winch, {color: colors[series.size % colors.length], points: []});
+    updateLegend();
+  }
+  const s = series.get(winch);
+  s.points.push({t: ts, v: value});
+  if (s.points.length > MAX_POINTS) s.points.shift();
+}
+
+function getYRange(){
+  let min = Infinity, max = -Infinity;
+  for (const s of series.values()) {
+    for (const p of s.points) {
+      if (p.v < min) min = p.v;
+      if (p.v > max) max = p.v;
+    }
+  }
+  if (!isFinite(min) || !isFinite(max)) return {min: 0, max: 1};
+  if (min === max) return {min: min - 1, max: max + 1};
+  return {min, max};
+}
+
+function drawGrid(w, h){
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  const stepX = w / 12;
+  const stepY = h / 6;
+  for (let x = 0; x <= w; x += stepX) {
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+  }
+  for (let y = 0; y <= h; y += stepY) {
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  }
+}
+
+function draw(){
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  drawGrid(w, h);
+
+  const {min, max} = getYRange();
+  const pad = 8;
+  const scaleY = (v) => h - pad - ((v - min) / (max - min)) * (h - 2 * pad);
+  const now = Date.now() / 1000;
+  const span = 8.0;
+  const scaleX = (t) => w - pad - ((now - t) / span) * (w - 2 * pad);
+
+  if (threshold !== null) {
+    const y = scaleY(threshold);
+    ctx.strokeStyle = 'rgba(255,72,72,0.75)';
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  for (const [winch, s] of series.entries()) {
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    for (const p of s.points) {
+      const x = scaleX(p.t);
+      const y = scaleY(p.v);
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    }
+    ctx.stroke();
+  }
+}
+
+function handleStatus(js){
+  const status = document.getElementById('status-text');
+  if (js.ok === false) {
+    status.textContent = `Status error: ${js.error || 'unknown'}`;
+    return;
+  }
+  const now = Date.now() / 1000;
+  const halls = js.halls || {};
+  for (const [k, v] of Object.entries(halls)) {
+    pushPoint(k, Number(v), now);
+  }
+  if (typeof js.threshold === 'number') {
+    threshold = js.threshold;
+    document.getElementById('threshold-text').textContent = `Hall threshold: ${threshold}`;
+  }
+  status.textContent = `Mode: ${js.mode} | Fault: ${js.fault || 'none'} | Last update: ${fmtTime(js.last_update)}`;
+  draw();
+}
+
+function connectSSE(){
+  const es = new EventSource('/events');
+  es.onmessage = (evt) => {
+    try {
+      const js = JSON.parse(evt.data);
+      handleStatus(js);
+    } catch(e) {}
+  };
+  es.onerror = () => {
+    document.getElementById('status-text').textContent = 'Status stream disconnected';
+  };
+}
+
+function fmtTime(t){
+  if (!t) return 'n/a';
+  const d = new Date(t * 1000);
+  return d.toLocaleTimeString();
+}
+
+resizeCanvas();
+connectSSE();
+</script>
+</body>
+</html>
+        """
+    )
+
+
 @app.post("/mode/idle")
 def mode_idle():
     try:
         log.info("UI: mode idle")
+        mc.record_command("mode", "idle")
         mc.set_mode("IDLE")
         return ok()
     except Exception as exc:
+        log.error(f"UI: mode idle failed: {exc}")
         return err(str(exc))
 
 
@@ -302,9 +598,11 @@ def mode_idle():
 def mode_setup():
     try:
         log.info("UI: mode setup")
+        mc.record_command("mode", "setup")
         mc.set_mode("SETUP")
         return ok()
     except Exception as exc:
+        log.error(f"UI: mode setup failed: {exc}")
         return err(str(exc))
 
 
@@ -312,9 +610,11 @@ def mode_setup():
 def mode_test():
     try:
         log.info("UI: mode test")
+        mc.record_command("mode", "test")
         mc.set_mode("TEST")
         return ok()
     except Exception as exc:
+        log.error(f"UI: mode test failed: {exc}")
         return err(str(exc))
 
 
@@ -322,6 +622,7 @@ def mode_test():
 def clear_fault():
     try:
         log.info("UI: clear fault")
+        mc.record_command("fault", "clear")
         mc.clear_fault()
         return ok()
     except Exception as exc:
@@ -332,6 +633,7 @@ def clear_fault():
 def stop():
     reason = request.json.get("reason", "user stop") if request.is_json else "user stop"
     log.warning(f"UI: stop ({reason})")
+    mc.record_command("stop", reason)
     mc.stop_all(reason)
     return ok({"stopped": True, "reason": reason})
 
@@ -340,8 +642,18 @@ def stop():
 def stop_all_fault():
     reason = request.json.get("reason", "emergency stop") if request.is_json else "emergency stop"
     log.warning(f"UI: emergency stop ({reason})")
+    mc.record_command("stop_all", reason)
     mc.emergency_stop(reason)
     return ok({"stopped": True, "fault": True, "reason": reason})
+
+
+@app.post("/job/cancel")
+def cancel_job():
+    reason = request.json.get("reason", "user cancel") if request.is_json else "user cancel"
+    log.warning(f"UI: cancel job ({reason})")
+    mc.record_command("cancel_job", reason)
+    mc.cancel_job(reason)
+    return ok({"cancelled": True, "reason": reason})
 
 
 @app.post("/setup/jog")
@@ -351,6 +663,7 @@ def setup_jog():
     seconds = float(payload.get("seconds", 1.0))
     try:
         log.info(f"UI: setup jog rpm={rpm} sec={seconds}")
+        mc.record_command("setup_jog", f"rpm={rpm} sec={seconds}")
         label = mc.setup_jog(rpm=rpm, seconds=seconds)
         return ok({"job": label})
     except Exception as exc:
@@ -364,12 +677,13 @@ def setup_hall():
     seconds = float(payload.get("seconds", 0.0))
     direction = str(payload.get("direction", "forward"))
     try:
-        log.info(f"UI: setup hall rpm={rpm} sec={seconds} dir={direction}")
+        log.info(f"UI: setup hall rpm={rpm} dir={direction}")
+        mc.record_command("setup_hall", f"rpm={rpm} dir={direction}")
         label = mc.setup_hall_run(rpm=rpm, seconds=seconds, direction=direction)
-
-        # log.info(f"Started setup hall job: {"label"}")
-        return ok({"job": label})
+        log.info(f"UI: setup hall started job={label}")
+        return ok({"job": label, "status": mc.get_status()})
     except Exception as exc:
+        log.error(f"UI: setup hall failed: {exc}")
         return err(str(exc))
 
 
@@ -380,6 +694,7 @@ def test_up():
     seconds = float(payload.get("seconds", 10.0))
     try:
         log.info(f"UI: test up rpm={rpm} sec={seconds}")
+        mc.record_command("test_up", f"rpm={rpm} sec={seconds}")
         label = mc.test_up(rpm=rpm, seconds=seconds)
         return ok({"job": label})
     except Exception as exc:
@@ -395,6 +710,7 @@ def test_dir(name):
     seconds = float(payload.get("seconds", 6.0))
     try:
         log.info(f"UI: test dir={name} rpm={rpm} sec={seconds}")
+        mc.record_command("test_dir", f"dir={name} rpm={rpm} sec={seconds}")
         label = mc.test_direction(name=name, rpm=rpm, seconds=seconds)
         return ok({"job": label})
     except Exception as exc:

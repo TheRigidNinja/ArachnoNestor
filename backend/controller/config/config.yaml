@@ -5,6 +5,9 @@ evb:
 
 motion:
   hall_threshold: 1500
+  hall_max: 2800
+  hall_rpm_max: 1500
+  hall_rpm_min: 200
   poll_interval: 0.05
   stale_timeout: 1.5
   evb_backoff_initial: 0.2
@@ -17,6 +20,11 @@ motion:
   serial_port: "/dev/ttyUSB0"
   baud_rate: 9600
   device_address: 1
+  modbus_addresses:
+    1: 1
+    2: 2
+    3: 3
+    4: 4
 
 web:
   host: "0.0.0.0"
@@ -26,3 +34,10 @@ imu_json:
   host: "192.168.2.123"
   port: 5000
   timeout: 5.0
+
+log:
+  mode: "ui_only"
+  allow_modules: ["app.web_control"]
+  allow_prefixes: ["UI:", "Job start:", "Hall job start:", "job error", "hall job finished", "Hall job finished", "Setup hall stop", "Motion blocked", "Setup hall cmd", "Starting setup hall", "setup_hall_run:", "Cancel job:"]
+  # Temporary: helps debug RS485/Modbus comms when motors don't respond.
+  allow_prefixes: ["UI:", "Job start:", "Hall job start:", "job error", "hall job finished", "Hall job finished", "Setup hall stop", "Motion blocked", "Setup hall cmd", "Starting setup hall", "setup_hall_run:", "Cancel job:", "MODBUS:"]

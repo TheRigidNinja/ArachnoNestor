@@ -17,7 +17,7 @@ STOP_BITS = serial.STOPBITS_ONE  # 1 stop bit
 BYTE_SIZE = serial.EIGHTBITS  # 8 data bits
 TIMEOUT = 1                   # Timeout in seconds
 
-# Modbus device address
+# Modbus device address (default)
 DEVICE_ADDRESS = CONFIG["motion"]["device_address"]
 
 # Motor configuration
@@ -30,10 +30,10 @@ def calculate_crc(data):
     return [(crc_value & 0xFF), (crc_value >> 8) & 0xFF]  # Return CRC as [LSB, MSB]
 
 ## ------------------------------------- Function to send a Modbus RTU command with CRC
-def send_modbus_command(ser, function_code, address, value=None, count=None):
+def send_modbus_command(ser, function_code, address, value=None, count=None, slave: int | None = None):
     # Build the Modbus RTU frame
     frame = bytearray()
-    frame.append(DEVICE_ADDRESS)  # Slave address
+    frame.append(DEVICE_ADDRESS if slave is None else int(slave))  # Slave address
     frame.append(function_code)  # Function code
     frame.extend(address.to_bytes(2, byteorder='big'))  # Register address
 
@@ -68,23 +68,22 @@ def space_hex_string(hex_string):
     return spaced_hex
 
 ## ------------------------------------- Function to start the motor in forward or reverse direction
-def start_motorFR(ser, FR):
+def start_motorFR(ser, FR, slave: int | None = None):
     if FR == "F":
-        send_modbus_command(ser, 0x06, 0x8000, 0x0902)  # Forward
+        return send_modbus_command(ser, 0x06, 0x8000, 0x0902, slave=slave)  # Forward
     else:
-        send_modbus_command(ser, 0x06, 0x8000, 0x0B02)  # Reverse
+        return send_modbus_command(ser, 0x06, 0x8000, 0x0B02, slave=slave)  # Reverse
 
 ## ------------------------------------- Function to stop the motor (natural stop)
-def stop_motor_natural(ser):
-    print("Stopping motor naturally...")
-    send_modbus_command(ser, 0x06, 0x8000, 0x0802)
+def stop_motor_natural(ser, slave: int | None = None):
+    return send_modbus_command(ser, 0x06, 0x8000, 0x0802, slave=slave)
 
 ## -------------------------------------  Function to stop the motor (braking stop)
-def stop_motor_braking(ser):
-    send_modbus_command(ser, 0x06, 0x8000, 0x0D02)
+def stop_motor_braking(ser, slave: int | None = None):
+    return send_modbus_command(ser, 0x06, 0x8000, 0x0D02, slave=slave)
 
 ## ------------------------------------- Function to write speed (RPM)
-def write_rpm(ser, speed):
+def write_rpm(ser, speed, slave: int | None = None):
     # Ensure speed is within valid range (0–4000 RPM)
     if speed < 0 or speed > 4000:
         log.error("Speed must be between 0 and 4000 RPM")
@@ -103,12 +102,13 @@ def write_rpm(ser, speed):
     log.info(f"Setting speed to {speed} RPM (0x{speed_combined:04X})")
 
     # Send the command
-    response = send_modbus_command(ser, 0x06, 0x8005, speed_combined)
+    response = send_modbus_command(ser, 0x06, 0x8005, speed_combined, slave=slave)
     
     if response:
         log.info(f"Speed set to {speed} RPM successfully.")
     else:
         log.error("Failed to set speed. Check wiring and Modbus address.")
+    return response
 
 
 ## ------------------------------------- Function to read real speed (RPM)
@@ -294,14 +294,14 @@ class MotorBus:
             timeout=TIMEOUT,
         )
 
-    def write_rpm(self, rpm: int):
-        return write_rpm(self.ser, rpm)
+    def write_rpm(self, rpm: int, slave: int | None = None):
+        return write_rpm(self.ser, rpm, slave=slave)
 
-    def start(self, direction: str):
-        return start_motorFR(self.ser, direction)
+    def start(self, direction: str, slave: int | None = None):
+        return start_motorFR(self.ser, direction, slave=slave)
 
-    def stop(self):
-        return stop_motor_natural(self.ser)
+    def stop(self, slave: int | None = None):
+        return stop_motor_natural(self.ser, slave=slave)
 
     def close(self):
         try:
