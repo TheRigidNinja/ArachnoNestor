@@ -1,7 +1,7 @@
 import serial
 import time
 
-def scan_rs485_addresses(port='/dev/ttyUSB0', baudrate=9600, timeout=0.1):
+def scan_rs485_addresses(port='/dev/ttyUSB0', baudrate=9600, timeout=0.1, register=0x8000):
     try:
         ser = serial.Serial(port, baudrate, timeout=timeout, parity=serial.PARITY_NONE, stopbits=1, bytesize=8)
     except serial.SerialException as e:
@@ -11,16 +11,20 @@ def scan_rs485_addresses(port='/dev/ttyUSB0', baudrate=9600, timeout=0.1):
     print("Scanning for active Modbus RTU addresses...")
 
     for address in range(1, 250):  # Modbus addresses range from 1 to 247
-        request = bytes([address, 0x03, 0x00, 0x00, 0x00, 0x01])  # Function 0x03 (Read Holding Registers)
+        request = bytes([address, 0x03, (register >> 8) & 0xFF, register & 0xFF, 0x00, 0x01])  # Read 1 register
         crc = calculate_crc(request)
         request += crc
         
-        ser.flushInput()  # Clear input buffer
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            ser.flushInput()
         ser.write(request)
         time.sleep(0.1)  # Allow time for response
         
-        response = ser.read(7)  # Expecting a 7-byte response
-        if response and len(response) >= 5:  # Valid responses should be at least 5 bytes
+        # Read whatever came back (normal response is 7 bytes; exception response is 5 bytes)
+        response = ser.read(256)
+        if response and len(response) >= 5:
             print(f"Device found at address: {address} -> Response: {response.hex()}")
 
     ser.close()
