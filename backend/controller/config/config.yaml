@@ -5,9 +5,16 @@ evb:
 
 motion:
   hall_threshold: 1500
+  hall_run_max: 2200   # only run when hall_threshold <= hall <= hall_run_max
   hall_max: 2800
   hall_rpm_max: 1500
   hall_rpm_min: 200
+  hall_filter:
+    enabled: true
+    window: 3         # median filter window (samples)
+    max_valid: 4095   # reject readings above this as spikes
+    log: false        # set true to log "Hall spike:" messages
+    log_throttle_s: 2.0
   poll_interval: 0.05
   stale_timeout: 1.5
   evb_backoff_initial: 0.2
@@ -38,6 +45,5 @@ imu_json:
 log:
   mode: "ui_only"
   allow_modules: ["app.web_control"]
-  allow_prefixes: ["UI:", "Job start:", "Hall job start:", "job error", "hall job finished", "Hall job finished", "Setup hall stop", "Motion blocked", "Setup hall cmd", "Starting setup hall", "setup_hall_run:", "Cancel job:"]
-  # Temporary: helps debug RS485/Modbus comms when motors don't respond.
-  allow_prefixes: ["UI:", "Job start:", "Hall job start:", "job error", "hall job finished", "Hall job finished", "Setup hall stop", "Motion blocked", "Setup hall cmd", "Starting setup hall", "setup_hall_run:", "Cancel job:", "MODBUS:"]
+  # Note: This repo often runs with log.mode=ui_only; allow_prefixes keeps key safety/debug lines visible.
+  allow_prefixes: ["UI:", "Job start:", "Hall job start:", "job error", "hall job finished", "Hall job finished", "Setup hall stop", "Motion blocked", "Setup hall cmd", "Starting setup hall", "setup_hall_run:", "Cancel job:", "MODBUS:", "Hall spike:"]

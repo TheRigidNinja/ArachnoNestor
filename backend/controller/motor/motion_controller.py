@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from typing import Dict, List, Optional
 
 from config.settings import load_config
@@ -25,6 +26,7 @@ CONFIG = load_config()
 WINCH_IDS: List[int] = CONFIG["motion"]["winch_ids"]
 HALL_THRESHOLD = CONFIG["motion"]["hall_threshold"]
 HALL_MAX = CONFIG["motion"].get("hall_max", 2800)
+HALL_RUN_MAX = int(CONFIG["motion"].get("hall_run_max", 1900))
 HALL_RPM_MAX = CONFIG["motion"].get("hall_rpm_max", 1500)
 HALL_RPM_MIN = CONFIG["motion"].get("hall_rpm_min", 200)
 POLL_INTERVAL = CONFIG["motion"]["poll_interval"]
@@ -37,6 +39,12 @@ USE_POWER = CONFIG["motion"].get("use_power", True)
 USE_IMU = CONFIG["motion"].get("use_imu", True)
 DEFAULT_DEVICE_ADDRESS = CONFIG["motion"].get("device_address", 1)
 MODBUS_ADDRESSES = CONFIG["motion"].get("modbus_addresses")
+HALL_FILTER = CONFIG["motion"].get("hall_filter", {}) or {}
+HALL_FILTER_ENABLED = bool(HALL_FILTER.get("enabled", True))
+HALL_FILTER_WINDOW = max(1, int(HALL_FILTER.get("window", 3)))
+HALL_RAW_MAX_VALID = int(HALL_FILTER.get("max_valid", 4095))
+HALL_FILTER_LOG = bool(HALL_FILTER.get("log", False))
+HALL_FILTER_LOG_THROTTLE_S = float(HALL_FILTER.get("log_throttle_s", 2.0))
 
 log = get_logger("motor.motion_controller")
 
@@ -113,6 +121,34 @@ class MotionController:
         self._motor_state = {w: {"running": False, "rpm": 0, "dir": None} for w in WINCH_IDS}
         self._safety = SafetyMonitor(hall_threshold=HALL_THRESHOLD, stale_timeout_s=STALE_TIMEOUT)
         self._motor_addr = self._build_motor_addr()
+        self._hall_hist = {w: deque(maxlen=HALL_FILTER_WINDOW) for w in WINCH_IDS}
+        self._hall_last_good: Dict[int, int] = {w: 0 for w in WINCH_IDS}
+        self._hall_last_log_ts: Dict[int, float] = {w: 0.0 for w in WINCH_IDS}
+
+    def _filter_hall(self, winch_id: int, hall_raw: int) -> int:
+        if not HALL_FILTER_ENABLED:
+            return int(hall_raw)
+        hv = int(hall_raw)
+        # Basic sanity gate: EVB packets are parsed as u16, but the sensor is expected
+        # to live in a much smaller range. Reject clearly invalid spikes.
+        if hv < 0 or hv > HALL_RAW_MAX_VALID:
+            if HALL_FILTER_LOG:
+                now = time.time()
+                last = self._hall_last_log_ts.get(winch_id, 0.0)
+                if (now - last) >= HALL_FILTER_LOG_THROTTLE_S:
+                    self._hall_last_log_ts[winch_id] = now
+                    log.info(f"Hall spike: winch={winch_id} raw={hv} -> holding last={self._hall_last_good.get(winch_id, 0)}")
+            return int(self._hall_last_good.get(winch_id, 0))
+
+        hist = self._hall_hist[winch_id]
+        hist.append(hv)
+        if len(hist) < 3:
+            filtered = hv
+        else:
+            s = sorted(hist)
+            filtered = s[len(s) // 2]  # median
+        self._hall_last_good[winch_id] = int(filtered)
+        return int(filtered)
 
     def _build_motor_addr(self) -> Dict[int, int]:
         if MODBUS_ADDRESSES is None:
@@ -559,12 +595,15 @@ class MotionController:
         self._apply_motor_ops(ops)
 
     def _hall_to_rpm(self, hall_val: int) -> int:
-        if HALL_MAX <= HALL_THRESHOLD:
+        effective_max = min(int(HALL_MAX), int(HALL_RUN_MAX))
+        if effective_max <= HALL_THRESHOLD:
             return HALL_RPM_MIN
         if hall_val < HALL_THRESHOLD:
             return 0
-        span = HALL_MAX - HALL_THRESHOLD
-        ratio = (hall_val - HALL_THRESHOLD) / span
+        # Clamp at the effective max so 1900 maps to max RPM if configured.
+        hall_val = min(int(hall_val), effective_max)
+        span = effective_max - HALL_THRESHOLD
+        ratio = (hall_val - HALL_THRESHOLD) / span if span > 0 else 0.0
         rpm = ratio * HALL_RPM_MAX
         rpm = max(0.0, min(float(HALL_RPM_MAX), rpm))
         rpm = max(float(HALL_RPM_MIN), rpm)
@@ -597,10 +636,14 @@ class MotionController:
                     continue
 
                 hall_val = halls.get(motor_id)
-                if hall_val is None or hall_val < HALL_THRESHOLD:
+                if hall_val is None or hall_val < HALL_THRESHOLD or hall_val > HALL_RUN_MAX:
                     if st["running"]:
                         ops.append(("stop", slave, None))
                         st["running"] = False
+                        if hall_val is not None and hall_val > HALL_RUN_MAX:
+                            log_lines.append(
+                                f"Setup hall stop: winch={motor_id} hall={hall_val} (> {HALL_RUN_MAX}) slave={slave}"
+                            )
                     continue
 
                 desired_dir = "F" if direction > 0 else "R"
@@ -660,7 +703,7 @@ class MotionController:
                             for w in WINCH_IDS:
                                 if USE_BUNDLE:
                                     bundle = evb.bundle(w)
-                                    halls[w] = bundle.hall_raw
+                                    halls[w] = self._filter_hall(w, bundle.hall_raw)
                                     if USE_POWER:
                                         power[w] = {
                                             "bus_mv": bundle.bus_mv,
@@ -670,7 +713,7 @@ class MotionController:
                                     bundles[w] = bundle.__dict__
                                 else:
                                     snap = evb.snapshot(w)
-                                    halls[w] = snap.hall_raw
+                                    halls[w] = self._filter_hall(w, snap.hall_raw)
                                     bundles[w] = {
                                         "winch": snap.winch,
                                         "total_count": snap.total_count,

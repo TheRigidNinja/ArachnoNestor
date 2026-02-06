@@ -75,14 +75,13 @@ def index():
       border-color: var(--bs-btn-active-border-color);
       color: var(--bs-btn-active-color);
     }
-    .invert-active .btn-check:focus + .btn,
-    .invert-active .btn:focus {
-      box-shadow: 0 0 0 0.2rem rgba(0,0,0,0.25);
-    }
-    label.disabled { opacity: 0.5; }
-  </style>
-</head>
-<body>
+	    .invert-active .btn-check:focus + .btn,
+	    .invert-active .btn:focus {
+	      box-shadow: 0 0 0 0.2rem rgba(0,0,0,0.25);
+	    }
+	  </style>
+	</head>
+	<body>
   <div class="container-fluid">
     <h3 class="mb-3">Supervisor Control</h3>
     <div class="mb-3">
@@ -114,28 +113,17 @@ def index():
           </div>
         </div>
       </div>
-      <div class="col-lg-4">
-        <div class="card shadow-sm">
-          <div class="card-header">Setup Hall Run (requires SETUP mode)</div>
-          <div class="card-body">
-            <div class="row g-2 mb-2">
-              <div class="col-12">
-                <label class="form-label disabled">Max Seconds (disabled)</label>
-                <input id="setup-sec" type="number" step="0.1" class="form-control" value="0" disabled>
-              </div>
-            </div>
-            <div class="btn-group w-100 mb-2 invert-active" role="group" aria-label="Setup direction">
-              <input type="radio" class="btn-check" name="setup-dir" id="setup-dir-fwd" autocomplete="off" checked>
-              <label class="btn btn-outline-dark" for="setup-dir-fwd">Forward</label>
-              <input type="radio" class="btn-check" name="setup-dir" id="setup-dir-rev" autocomplete="off">
-              <label class="btn btn-outline-dark" for="setup-dir-rev">Reverse</label>
-            </div>
-            <button class="btn btn-primary w-100" onclick="post('/setup/hall', {direction:getSetupDir()})">Run Hall</button>
-            <button class="btn btn-outline-secondary w-100 mt-2" onclick="post('/job/cancel', {reason:'ui cancel'})">Cancel Job</button>
-          </div>
-        </div>
-        <div class="card shadow-sm">
-          <div class="card-header">UP Test (requires TEST mode)</div>
+	      <div class="col-lg-4">
+	        <div class="card shadow-sm">
+	          <div class="card-header">Setup Hall Run (requires SETUP mode)</div>
+	          <div class="card-body d-grid gap-2">
+	            <button class="btn btn-primary" onclick="post('/setup/hall', {direction:'forward'})">Run Hall Forward</button>
+	            <button class="btn btn-primary" onclick="post('/setup/hall', {direction:'reverse'})">Run Hall Reverse</button>
+	            <button class="btn btn-outline-secondary" onclick="post('/job/cancel', {reason:'ui cancel'})">Cancel Job</button>
+	          </div>
+	        </div>
+	        <div class="card shadow-sm">
+	          <div class="card-header">UP Test (requires TEST mode)</div>
           <div class="card-body">
             <div class="row g-2 mb-2">
               <div class="col-6">
@@ -221,18 +209,21 @@ async function post(url, data) {
   document.getElementById('status-json').textContent = JSON.stringify(js, null, 2);
   refreshStatus();
 }
-async function refreshStatus(){
-  const res = await fetch('/status');
-  const js = await res.json().catch(()=>({ok:false,error:'bad json'}));
-  renderStatus(js);
-}
-function getVal(id){ return parseFloat(document.getElementById(id).value) || 0; }
-function dir(name){ post(`/test/dir/${name}`, {rpm:getVal('dir-rpm'), seconds:getVal('dir-sec')}); }
-function getSetupDir(){ return document.getElementById('setup-dir-rev').checked ? 'reverse' : 'forward'; }
-async function setMode(mode){
-  await post(`/mode/${mode}`);
-}
-function renderStatus(js){
+	async function refreshStatus(){
+	  const res = await fetch('/status');
+	  const js = await res.json().catch(()=>({ok:false,error:'bad json'}));
+	  renderStatus(js);
+	}
+	function getVal(id){ return parseFloat(document.getElementById(id).value) || 0; }
+	function dir(name){ post(`/test/dir/${name}`, {rpm:getVal('dir-rpm'), seconds:getVal('dir-sec')}); }
+	async function setMode(mode){
+	  // TEST mode requires setup_activated; entering SETUP first arms tests.
+	  if (mode === 'test') {
+	    await post('/mode/setup');
+	  }
+	  await post(`/mode/${mode}`);
+	}
+	function renderStatus(js){
   document.getElementById('status-json').textContent = JSON.stringify(js, null, 2);
   if (js.ok === false) {
     document.getElementById('status-text').textContent = `Status error: ${js.error || 'unknown'}`;
@@ -254,14 +245,28 @@ function renderStatus(js){
     document.getElementById('status-text').textContent += ` | MaxHall: 1=${mh['1'] ?? '?'} 2=${mh['2'] ?? '?'} 3=${mh['3'] ?? '?'} 4=${mh['4'] ?? '?'}`;
   }
 
-  document.getElementById('mode-idle').checked = (js.mode === 'IDLE');
-  document.getElementById('mode-setup').checked = (js.mode === 'SETUP');
-  document.getElementById('mode-test').checked = (js.mode === 'TEST');
-  const upBtn = document.getElementById('up-test-btn');
-  if (upBtn) upBtn.disabled = false;
+	  document.getElementById('mode-idle').checked = (js.mode === 'IDLE');
+	  document.getElementById('mode-setup').checked = (js.mode === 'SETUP');
+	  document.getElementById('mode-test').checked = (js.mode === 'TEST');
 
-  const halls = js.halls || {};
-  let hallsHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Hall</th></tr></thead><tbody>';
+	  const inTest = (js.mode === 'TEST');
+	  const upBtn = document.getElementById('up-test-btn');
+	  if (upBtn) upBtn.disabled = !inTest;
+	  const upRpm = document.getElementById('up-rpm');
+	  const upSec = document.getElementById('up-sec');
+	  if (upRpm) upRpm.disabled = !inTest;
+	  if (upSec) upSec.disabled = !inTest;
+	  const dirRpm = document.getElementById('dir-rpm');
+	  const dirSec = document.getElementById('dir-sec');
+	  if (dirRpm) dirRpm.disabled = !inTest;
+	  if (dirSec) dirSec.disabled = !inTest;
+	  for (const id of ['dir-forward','dir-back','dir-left','dir-right','dir-up','dir-down']) {
+	    const el = document.getElementById(id);
+	    if (el) el.disabled = !inTest;
+	  }
+
+	  const halls = js.halls || {};
+	  let hallsHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Hall</th></tr></thead><tbody>';
   for (const [k,v] of Object.entries(halls)) { hallsHtml += `<tr><td>${k}</td><td>${v}</td></tr>`; }
   hallsHtml += '</tbody></table>';
   document.getElementById('halls-table').innerHTML = '<strong>Hall</strong>' + hallsHtml;
