@@ -30,6 +30,19 @@ Then open:
 - `http://<mini_pc_ip>:8080/`
 - `http://<mini_pc_ip>:8080/status`
 
+## EVB helper commands
+
+```bash
+python3 evb_client.py save-encoders
+python3 evb_client.py arm-tension 1 1100 1
+python3 evb_client.py wait-tension 1 0
+python3 evb_client.py arm-target 1 800
+python3 evb_client.py wait-target 1 10000
+```
+
+The PC still drives motors through USB-RS485. These commands only ask EVB/Compact
+to watch sensor state and report when a trigger is hit.
+
 ## Safety rules
 
 - If any hall < 1500, all motors stop and system enters FAULT.

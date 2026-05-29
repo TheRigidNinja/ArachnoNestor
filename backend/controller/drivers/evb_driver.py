@@ -49,6 +49,64 @@ class Imu:
     cache_age_ms: int | None = None
 
 
+@dataclass
+class EncoderTarget:
+    winch: int
+    ok: int
+    active: int
+    hit: int
+    start_count: int
+    target_delta: int
+    current_delta: int
+    current_total: int
+    hit_total: int
+
+
+@dataclass
+class TensionTrigger:
+    winch: int
+    ok: int
+    active: int
+    hit: int
+    direction: int
+    threshold_raw: int
+    start_raw: int
+    current_raw: int
+    hit_raw: int
+    current_total: int
+    hit_total: int
+
+
+def _target_from_dict(status: dict) -> EncoderTarget:
+    return EncoderTarget(
+        winch=status["winch"],
+        ok=status["ok"],
+        active=status["active"],
+        hit=status["hit"],
+        start_count=status["start_count"],
+        target_delta=status["target_delta"],
+        current_delta=status["current_delta"],
+        current_total=status["current_total"],
+        hit_total=status["hit_total"],
+    )
+
+
+def _tension_from_dict(status: dict) -> TensionTrigger:
+    return TensionTrigger(
+        winch=status["winch"],
+        ok=status["ok"],
+        active=status["active"],
+        hit=status["hit"],
+        direction=status["direction"],
+        threshold_raw=status["threshold_raw"],
+        start_raw=status["start_raw"],
+        current_raw=status["current_raw"],
+        hit_raw=status["hit_raw"],
+        current_total=status["current_total"],
+        hit_total=status["hit_total"],
+    )
+
+
 def get_bundle(cli: EvbClient, winch_id: int) -> Bundle:
     b = evb_api.get_bundle(cli, winch_id)
     return Bundle(
@@ -102,6 +160,42 @@ def get_distance(cli: EvbClient) -> dict:
     return evb_api.get_distance(cli)
 
 
+def arm_encoder_target(cli: EvbClient, winch_id: int, target_delta: int) -> EncoderTarget:
+    return _target_from_dict(evb_api.arm_encoder_target(cli, winch_id, target_delta))
+
+
+def get_encoder_target(cli: EvbClient, winch_id: int) -> EncoderTarget:
+    return _target_from_dict(evb_api.get_encoder_target(cli, winch_id))
+
+
+def wait_encoder_target(cli: EvbClient, winch_id: int, timeout_ms: int) -> EncoderTarget:
+    return _target_from_dict(evb_api.wait_encoder_target(cli, winch_id, timeout_ms))
+
+
+def disarm_encoder_target(cli: EvbClient, winch_id: int) -> EncoderTarget:
+    return _target_from_dict(evb_api.disarm_encoder_target(cli, winch_id))
+
+
+def arm_tension_trigger(cli: EvbClient, winch_id: int, threshold_raw: int, direction: int) -> TensionTrigger:
+    return _tension_from_dict(evb_api.arm_tension_trigger(cli, winch_id, threshold_raw, direction))
+
+
+def get_tension_trigger(cli: EvbClient, winch_id: int) -> TensionTrigger:
+    return _tension_from_dict(evb_api.get_tension_trigger(cli, winch_id))
+
+
+def wait_tension_trigger(cli: EvbClient, winch_id: int, timeout_ms: int) -> TensionTrigger:
+    return _tension_from_dict(evb_api.wait_tension_trigger(cli, winch_id, timeout_ms))
+
+
+def disarm_tension_trigger(cli: EvbClient, winch_id: int) -> TensionTrigger:
+    return _tension_from_dict(evb_api.disarm_tension_trigger(cli, winch_id))
+
+
+def save_encoders(cli: EvbClient) -> bool:
+    return evb_api.save_encoders(cli)
+
+
 class EVBDriver:
     """Context-managed EVB driver using tcp/evb as gateway."""
 
@@ -144,3 +238,30 @@ class EVBDriver:
 
     def ping(self) -> bool:
         return evb_api.ping(self.client)
+
+    def arm_encoder_target(self, winch_id: int, target_delta: int) -> EncoderTarget:
+        return arm_encoder_target(self.client, winch_id, target_delta)
+
+    def encoder_target(self, winch_id: int) -> EncoderTarget:
+        return get_encoder_target(self.client, winch_id)
+
+    def wait_encoder_target(self, winch_id: int, timeout_ms: int) -> EncoderTarget:
+        return wait_encoder_target(self.client, winch_id, timeout_ms)
+
+    def disarm_encoder_target(self, winch_id: int) -> EncoderTarget:
+        return disarm_encoder_target(self.client, winch_id)
+
+    def arm_tension_trigger(self, winch_id: int, threshold_raw: int, direction: int) -> TensionTrigger:
+        return arm_tension_trigger(self.client, winch_id, threshold_raw, direction)
+
+    def tension_trigger(self, winch_id: int) -> TensionTrigger:
+        return get_tension_trigger(self.client, winch_id)
+
+    def wait_tension_trigger(self, winch_id: int, timeout_ms: int) -> TensionTrigger:
+        return wait_tension_trigger(self.client, winch_id, timeout_ms)
+
+    def disarm_tension_trigger(self, winch_id: int) -> TensionTrigger:
+        return disarm_tension_trigger(self.client, winch_id)
+
+    def save_encoders(self) -> bool:
+        return save_encoders(self.client)

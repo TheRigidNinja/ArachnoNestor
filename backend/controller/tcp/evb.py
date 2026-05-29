@@ -10,7 +10,43 @@ from __future__ import annotations
 import struct
 
 from tcp.client import EvbClient, DeviceError
-from protocol.evb_packets import PING, SNAPSHOT, DELTA, DISTANCE, BUNDLE, IMU, ERROR, EXPECTED_LENGTHS
+from protocol.evb_packets import (
+    ARM_ENCODER_TARGET,
+    ARM_TENSION_TRIGGER,
+    BUNDLE,
+    DELTA,
+    DISARM_ENCODER_TARGET,
+    DISARM_TENSION_TRIGGER,
+    DISTANCE,
+    ERROR,
+    EXPECTED_LENGTHS,
+    GET_ENCODER_TARGET,
+    GET_TENSION_TRIGGER,
+    IMU,
+    PING,
+    SAVE_ENCODERS,
+    SNAPSHOT,
+    WAIT_ENCODER_TARGET,
+    WAIT_TENSION_TRIGGER,
+)
+
+
+def _send(cli: EvbClient, msg_type: int, payload: bytes, timeout: float | None = None):
+    if timeout is None:
+        return cli.send(msg_type, payload)
+
+    if not cli.sock:
+        cli.connect()
+    if not cli.sock:
+        raise RuntimeError("EVB client failed to connect")
+
+    old_timeout = cli.sock.gettimeout()
+    cli.sock.settimeout(timeout)
+    try:
+        return cli.send(msg_type, payload)
+    finally:
+        if cli.sock:
+            cli.sock.settimeout(old_timeout)
 
 _LEGACY_SNAPSHOT_LEN = 7
 _LEGACY_DELTA_LEN = 5
@@ -39,7 +75,7 @@ def get_snapshot(cli: EvbClient, winch_id: int):
         raise RuntimeError(f"winch {winch_id}: bad snapshot response type=0x{resp_type:02X} len={len(payload)}")
     _require_len(resp_type, payload, EXPECTED_LENGTHS[SNAPSHOT], _LEGACY_SNAPSHOT_LEN)
     r_winch = payload[0]
-    total_count = int.from_bytes(payload[1:5], "little", signed=False)
+    total_count = int.from_bytes(payload[1:5], "little", signed=True)
     hall_raw = int.from_bytes(payload[5:7], "little", signed=False)
     return r_winch, total_count, hall_raw
 
@@ -141,6 +177,122 @@ def get_imu(cli: EvbClient):
         "yaw": vals[9],
         "cache_age_ms": cache_age_ms,
     }
+
+
+def parse_encoder_target_status(payload: bytes) -> dict:
+    if len(payload) != EXPECTED_LENGTHS[GET_ENCODER_TARGET]:
+        raise RuntimeError(f"bad encoder target payload len={len(payload)}")
+    winch, ok, active, hit = struct.unpack_from("<BBBB", payload, 0)
+    start_count, target_delta, current_delta, current_total, hit_total = struct.unpack_from("<iiiii", payload, 4)
+    return {
+        "winch": winch,
+        "ok": ok,
+        "active": active,
+        "hit": hit,
+        "start_count": start_count,
+        "target_delta": target_delta,
+        "current_delta": current_delta,
+        "current_total": current_total,
+        "hit_total": hit_total,
+    }
+
+
+def parse_tension_trigger_status(payload: bytes) -> dict:
+    if len(payload) != EXPECTED_LENGTHS[GET_TENSION_TRIGGER]:
+        raise RuntimeError(f"bad tension trigger payload len={len(payload)}")
+    winch, ok, active, hit, direction = struct.unpack_from("<BBBBb", payload, 0)
+    threshold_raw, start_raw, current_raw, hit_raw = struct.unpack_from("<HHHH", payload, 6)
+    current_total, hit_total = struct.unpack_from("<ii", payload, 14)
+    return {
+        "winch": winch,
+        "ok": ok,
+        "active": active,
+        "hit": hit,
+        "direction": direction,
+        "threshold_raw": threshold_raw,
+        "start_raw": start_raw,
+        "current_raw": current_raw,
+        "hit_raw": hit_raw,
+        "current_total": current_total,
+        "hit_total": hit_total,
+    }
+
+
+def arm_encoder_target(cli: EvbClient, winch_id: int, target_delta: int):
+    payload = bytes([winch_id]) + struct.pack("<i", int(target_delta))
+    resp_type, reply = cli.send(ARM_ENCODER_TARGET, payload)
+    if resp_type != ARM_ENCODER_TARGET:
+        raise RuntimeError(f"winch {winch_id}: bad arm target response type=0x{resp_type:02X}")
+    return parse_encoder_target_status(reply)
+
+
+def get_encoder_target(cli: EvbClient, winch_id: int):
+    resp_type, payload = cli.send(GET_ENCODER_TARGET, bytes([winch_id]))
+    if resp_type != GET_ENCODER_TARGET:
+        raise RuntimeError(f"winch {winch_id}: bad target status response type=0x{resp_type:02X}")
+    return parse_encoder_target_status(payload)
+
+
+def wait_encoder_target(cli: EvbClient, winch_id: int, timeout_ms: int):
+    payload = bytes([winch_id]) + struct.pack("<I", int(timeout_ms))
+    timeout_s = getattr(cli, "timeout", 1.0)
+    wait_timeout_s = max(timeout_s, (timeout_ms / 1000.0) + 1.0) if timeout_ms > 0 else None
+    resp_type, reply = _send(cli, WAIT_ENCODER_TARGET, payload, wait_timeout_s)
+    if resp_type != WAIT_ENCODER_TARGET:
+        raise RuntimeError(f"winch {winch_id}: bad wait target response type=0x{resp_type:02X}")
+    return parse_encoder_target_status(reply)
+
+
+def disarm_encoder_target(cli: EvbClient, winch_id: int):
+    resp_type, payload = cli.send(DISARM_ENCODER_TARGET, bytes([winch_id]))
+    if resp_type != DISARM_ENCODER_TARGET:
+        raise RuntimeError(f"winch {winch_id}: bad disarm target response type=0x{resp_type:02X}")
+    return parse_encoder_target_status(payload)
+
+
+def arm_tension_trigger(cli: EvbClient, winch_id: int, threshold_raw: int, direction: int):
+    if not 0 <= int(threshold_raw) <= 0xFFFF:
+        raise ValueError("threshold_raw must be 0..65535")
+    if not -128 <= int(direction) <= 127:
+        raise ValueError("direction must fit int8")
+    payload = bytes([winch_id]) + struct.pack("<Hb", int(threshold_raw), int(direction))
+    resp_type, reply = cli.send(ARM_TENSION_TRIGGER, payload)
+    if resp_type != ARM_TENSION_TRIGGER:
+        raise RuntimeError(f"winch {winch_id}: bad arm tension response type=0x{resp_type:02X}")
+    return parse_tension_trigger_status(reply)
+
+
+def get_tension_trigger(cli: EvbClient, winch_id: int):
+    resp_type, payload = cli.send(GET_TENSION_TRIGGER, bytes([winch_id]))
+    if resp_type != GET_TENSION_TRIGGER:
+        raise RuntimeError(f"winch {winch_id}: bad tension status response type=0x{resp_type:02X}")
+    return parse_tension_trigger_status(payload)
+
+
+def wait_tension_trigger(cli: EvbClient, winch_id: int, timeout_ms: int):
+    payload = bytes([winch_id]) + struct.pack("<I", int(timeout_ms))
+    timeout_s = getattr(cli, "timeout", 1.0)
+    wait_timeout_s = max(timeout_s, (timeout_ms / 1000.0) + 1.0) if timeout_ms > 0 else None
+    resp_type, reply = _send(cli, WAIT_TENSION_TRIGGER, payload, wait_timeout_s)
+    if resp_type != WAIT_TENSION_TRIGGER:
+        raise RuntimeError(f"winch {winch_id}: bad wait tension response type=0x{resp_type:02X}")
+    return parse_tension_trigger_status(reply)
+
+
+def disarm_tension_trigger(cli: EvbClient, winch_id: int):
+    resp_type, payload = cli.send(DISARM_TENSION_TRIGGER, bytes([winch_id]))
+    if resp_type != DISARM_TENSION_TRIGGER:
+        raise RuntimeError(f"winch {winch_id}: bad disarm tension response type=0x{resp_type:02X}")
+    return parse_tension_trigger_status(payload)
+
+
+def save_encoders(cli: EvbClient) -> bool:
+    resp_type, payload = cli.send(SAVE_ENCODERS, b"")
+    if resp_type != SAVE_ENCODERS or len(payload) != EXPECTED_LENGTHS[SAVE_ENCODERS]:
+        raise RuntimeError(f"save encoders: bad response type=0x{resp_type:02X} len={len(payload)}")
+    return payload[0] != 0
+
+
 def ping(cli: EvbClient):
     resp_type, payload = cli.send(PING, b"")
     if resp_type == ERROR:
