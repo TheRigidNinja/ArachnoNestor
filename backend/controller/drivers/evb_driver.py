@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from tcp.client import EvbClient, DeviceError
 from tcp import evb as evb_api
+
+
+@dataclass
+class Delta:
+    winch: int
+    delta_count: int
 
 
 @dataclass
@@ -23,6 +28,7 @@ class Bundle:
     bus_mv: int
     current_ma: int
     power_mw: int
+    cache_age_ms: int | None = None
 
 
 @dataclass
@@ -40,6 +46,7 @@ class Imu:
     pitch: float
     roll: float
     yaw: float
+    cache_age_ms: int | None = None
 
 
 def get_bundle(cli: EvbClient, winch_id: int) -> Bundle:
@@ -57,6 +64,7 @@ def get_bundle(cli: EvbClient, winch_id: int) -> Bundle:
         bus_mv=b["bus_mv"],
         current_ma=b["current_ma"],
         power_mw=b["power_mw"],
+        cache_age_ms=b.get("cache_age_ms"),
     )
 
 
@@ -69,6 +77,14 @@ def get_snapshot(cli: EvbClient, winch_id: int) -> Snapshot:
     )
 
 
+def get_delta(cli: EvbClient, winch_id: int) -> Delta:
+    r_winch, delta_count = evb_api.get_delta(cli, winch_id)
+    return Delta(
+        winch=r_winch,
+        delta_count=delta_count,
+    )
+
+
 def get_imu(cli: EvbClient) -> Imu:
     i = evb_api.get_imu(cli)
     return Imu(
@@ -78,6 +94,7 @@ def get_imu(cli: EvbClient) -> Imu:
         pitch=i["pitch"],
         roll=i["roll"],
         yaw=i["yaw"],
+        cache_age_ms=i.get("cache_age_ms"),
     )
 
 
@@ -116,8 +133,14 @@ class EVBDriver:
     def snapshot(self, winch_id: int) -> Snapshot:
         return get_snapshot(self.client, winch_id)
 
+    def delta(self, winch_id: int) -> Delta:
+        return get_delta(self.client, winch_id)
+
     def imu(self) -> Imu:
         return get_imu(self.client)
 
     def distance(self) -> dict:
         return get_distance(self.client)
+
+    def ping(self) -> bool:
+        return evb_api.ping(self.client)

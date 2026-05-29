@@ -32,3 +32,8 @@
 
 No module may directly control hardware unless it is explicitly designated
 as a driver or the motion controller. Violations are bugs, not features.
+
+11) Hardware diagnostics must match known-good vendor behavior first.
+   - For BLD510/BLDC510 controller detection, use a read-only probe of register `0x8005` unless a controller manual or captured vendor frame proves a better register.
+   - Do not invent Modbus probe registers from nearby code. Verify against documented registers, vendor software traffic, or an explicitly provided hardware trace.
+   - If vendor frames are available, mirror their function code, register, byte order, baud rate, and timing before changing wiring assumptions.

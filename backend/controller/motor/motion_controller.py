@@ -490,6 +490,7 @@ class MotionController:
                                     "pitch": imu.pitch,
                                     "roll": imu.roll,
                                     "yaw": imu.yaw,
+                                    "cache_age_ms": imu.cache_age_ms,
                                 }
                             self.last_update = now
                             status = self._safety.evaluate(self.last_halls, self.last_update)

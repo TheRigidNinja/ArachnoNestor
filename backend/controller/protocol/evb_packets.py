@@ -15,15 +15,16 @@ ERROR = 0xE0
 
 # Expected payload lengths
 EXPECTED_LENGTHS = {
-    SNAPSHOT: 7,
-    DELTA: 5,
-    DISTANCE: 9,
-    BUNDLE: 28,
-    IMU: 40,
+    SNAPSHOT: 11,
+    DELTA: 9,
+    DISTANCE: 13,
+    BUNDLE: 32,
+    IMU: 44,
 }
 
 ERROR_CODES = {
     1: "bad length",
     2: "compact timeout",
     3: "unknown command",
+    4: "no data",
 }

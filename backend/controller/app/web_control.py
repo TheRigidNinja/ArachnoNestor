@@ -7,6 +7,7 @@ import time
 from flask import Flask, Response, jsonify, request
 
 from config.settings import load_config
+from drivers.evb_driver import EVBDriver
 from motor.motion_controller import get_controller, DIRECTION_MAP
 from logutil.logger import get_logger
 
@@ -61,6 +62,64 @@ def events():
                 yield f"data: {json.dumps({'ok': False, 'error': str(exc)})}\n\n"
             time.sleep(0.02)
     return Response(stream(), mimetype="text/event-stream")
+
+
+def _dataclass_dict(obj):
+    return obj.__dict__.copy()
+
+
+def _capture_read(errors, label, func):
+    try:
+        return func()
+    except Exception as exc:
+        errors.append({"source": label, "error": str(exc)})
+        return None
+
+
+@app.get("/evb/live")
+def evb_live():
+    host = CONFIG["evb"]["host"]
+    port = CONFIG["evb"]["port"]
+    timeout = CONFIG["evb"]["timeout"]
+    winch_ids = CONFIG["motion"].get("winch_ids", [1, 2, 3, 4])
+    errors = []
+    payload = {
+        "ok": True,
+        "host": host,
+        "port": port,
+        "winches": {},
+        "distance": None,
+        "imu": None,
+        "errors": errors,
+    }
+
+    try:
+        with EVBDriver(host, port, timeout) as evb:
+            payload["ping"] = bool(_capture_read(errors, "ping", evb.ping))
+            for winch_id in winch_ids:
+                winch = {}
+                snapshot = _capture_read(errors, f"snapshot:{winch_id}", lambda w=winch_id: evb.snapshot(w))
+                delta = _capture_read(errors, f"delta:{winch_id}", lambda w=winch_id: evb.delta(w))
+                bundle = _capture_read(errors, f"bundle:{winch_id}", lambda w=winch_id: evb.bundle(w))
+                if snapshot is not None:
+                    winch["snapshot"] = _dataclass_dict(snapshot)
+                if delta is not None:
+                    winch["delta"] = _dataclass_dict(delta)
+                if bundle is not None:
+                    winch["bundle"] = _dataclass_dict(bundle)
+                payload["winches"][str(winch_id)] = winch
+
+            distance = _capture_read(errors, "distance", evb.distance)
+            imu = _capture_read(errors, "imu", evb.imu)
+            if distance is not None:
+                payload["distance"] = distance
+            if imu is not None:
+                payload["imu"] = _dataclass_dict(imu)
+    except Exception as exc:
+        log.error(f"/evb/live error: {exc}")
+        return jsonify({"ok": False, "host": host, "port": port, "error": str(exc)}), 503
+
+    return jsonify(payload)
 
 
 @app.get("/")
@@ -207,6 +266,14 @@ def index():
             <button class="btn btn-outline-secondary w-100" onclick="refreshStatus()">Refresh</button>
           </div>
         </div>
+        <div class="card shadow-sm mt-3">
+          <div class="card-header">EVB Live</div>
+          <div class="card-body">
+            <div id="evb-live-text" class="mb-2 small text-muted">Not loaded</div>
+            <pre id="evb-live-json" class="small">{}</pre>
+            <button class="btn btn-outline-secondary w-100" onclick="refreshEvb()">Refresh EVB</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -224,6 +291,11 @@ async function refreshStatus(){
   const res = await fetch('/status');
   const js = await res.json().catch(()=>({ok:false,error:'bad json'}));
   renderStatus(js);
+}
+async function refreshEvb(){
+  const res = await fetch('/evb/live');
+  const js = await res.json().catch(()=>({ok:false,error:'bad json'}));
+  renderEvb(js);
 }
 function getVal(id){ return parseFloat(document.getElementById(id).value) || 0; }
 function dir(name){ post(`/test/dir/${name}`, {rpm:getVal('dir-rpm'), seconds:getVal('dir-sec')}); }
@@ -258,9 +330,9 @@ function renderStatus(js){
   document.getElementById('power-table').innerHTML = '<strong>Power</strong>' + pHtml;
 
   const bundles = js.bundles || {};
-  let bHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Total</th><th>Delta</th><th>Hall</th><th>Dist(mm)</th><th>Strength</th><th>TempRaw</th><th>Age(ms)</th></tr></thead><tbody>';
+  let bHtml = '<table class="table table-sm table-bordered"><thead><tr><th>Winch</th><th>Flags</th><th>Total</th><th>Delta</th><th>Hall</th><th>Dist(mm)</th><th>Strength</th><th>TempRaw</th><th>Age(ms)</th><th>Bus</th><th>Current</th><th>Power</th><th>CacheAge</th></tr></thead><tbody>';
   for (const [k,v] of Object.entries(bundles)) {
-    bHtml += `<tr><td>${k}</td><td>${v.total_count ?? ''}</td><td>${v.delta_count ?? ''}</td><td>${v.hall_raw ?? ''}</td><td>${v.dist_mm ?? ''}</td><td>${v.strength ?? ''}</td><td>${v.temp_raw ?? ''}</td><td>${v.age_ms ?? ''}</td></tr>`;
+    bHtml += `<tr><td>${k}</td><td>${v.flags ?? ''}</td><td>${v.total_count ?? ''}</td><td>${v.delta_count ?? ''}</td><td>${v.hall_raw ?? ''}</td><td>${v.dist_mm ?? ''}</td><td>${v.strength ?? ''}</td><td>${v.temp_raw ?? ''}</td><td>${v.age_ms ?? ''}</td><td>${v.bus_mv ?? ''}</td><td>${v.current_ma ?? ''}</td><td>${v.power_mw ?? ''}</td><td>${v.cache_age_ms ?? ''}</td></tr>`;
   }
   bHtml += '</tbody></table>';
   document.getElementById('bundle-table').innerHTML = '<strong>Winch Sensors</strong>' + bHtml;
@@ -269,11 +341,23 @@ function renderStatus(js){
     const i = js.imu;
     const imuTxt = `Gyro: (${i.gyro[0].toFixed(2)}, ${i.gyro[1].toFixed(2)}, ${i.gyro[2].toFixed(2)}) | ` +
       `Accel: (${i.accel[0].toFixed(2)}, ${i.accel[1].toFixed(2)}, ${i.accel[2].toFixed(2)}) | ` +
-      `Pitch: ${i.pitch.toFixed(2)} Roll: ${i.roll.toFixed(2)} Yaw: ${i.yaw.toFixed(2)} | Temp: ${i.temp_c.toFixed(1)}C`;
+      `Pitch: ${i.pitch.toFixed(2)} Roll: ${i.roll.toFixed(2)} Yaw: ${i.yaw.toFixed(2)} | Temp: ${i.temp_c.toFixed(1)}C | CacheAge: ${i.cache_age_ms ?? ''}`;
     document.getElementById('imu-box').innerHTML = '<strong>IMU</strong><div class="small">' + imuTxt + '</div>';
   } else {
     document.getElementById('imu-box').innerHTML = '<strong>IMU</strong><div class="small text-muted">(no data yet)</div>';
   }
+}
+
+function renderEvb(js){
+  document.getElementById('evb-live-json').textContent = JSON.stringify(js, null, 2);
+  if (js.ok === false) {
+    document.getElementById('evb-live-text').textContent = `EVB error: ${js.error || 'unknown'}`;
+    return;
+  }
+  const errorCount = (js.errors || []).length;
+  const winchCount = Object.keys(js.winches || {}).length;
+  document.getElementById('evb-live-text').textContent =
+    `Host: ${js.host}:${js.port} | Ping: ${js.ping ? 'ok' : 'fail'} | Winches: ${winchCount} | Read errors: ${errorCount}`;
 }
 
 function connectSSE(){
@@ -290,6 +374,7 @@ function connectSSE(){
 }
 function fmtTime(t){ if(!t) return 'n/a'; const d=new Date(t*1000); return d.toLocaleTimeString(); }
 connectSSE();
+refreshEvb();
 </script>
 
 </body>
