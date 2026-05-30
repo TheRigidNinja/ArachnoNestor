@@ -17,7 +17,10 @@ motion:
   serial_port: "/dev/ttyUSB0"
   baud_rate: 9600
   serial_timeout: 0.25
-  nonblocking_command_gap: 0.02
+  nonblocking_command_gap: 0.06
+  manual_command_gap: 0.06
+  manual_first_command_wait_response: true
+  log_modbus_frames: true
   device_address: 1
 
 web:

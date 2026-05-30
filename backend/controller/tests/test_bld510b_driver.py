@@ -52,6 +52,25 @@ class TestBLD510BDriver(unittest.TestCase):
         self.assertEqual(ser.frames[0][2:4], b"\x80\x00")
         self.assertEqual(ser.frames[0][4:6], b"\x0D\x02")
 
+    def test_format_hex_uses_uppercase_spaced_bytes(self):
+        self.assertEqual(bld510b.format_hex(bytes.fromhex("02068005c800e7f8")), "02 06 80 05 C8 00 E7 F8")
+
+    def test_winch_three_150_rpm_expected_frame(self):
+        ser = FakeSerial(response=b"")
+        bld510b.write_rpm(ser, 150, device_address=3, wait_response=False)
+        self.assertEqual(bld510b.format_hex(ser.frames[0]), "03 06 80 05 96 00 DE 49")
+
+    def test_winch_three_expected_start_stop_frames(self):
+        ser = FakeSerial(response=b"")
+        bld510b.start_motorFR(ser, "F", device_address=3, wait_response=False)
+        bld510b.start_motorFR(ser, "R", device_address=3, wait_response=False)
+        bld510b.stop_motor_natural(ser, device_address=3, wait_response=False)
+        bld510b.stop_motor_braking(ser, device_address=3, wait_response=False)
+        self.assertEqual(bld510b.format_hex(ser.frames[0]), "03 06 80 00 09 02 26 79")
+        self.assertEqual(bld510b.format_hex(ser.frames[1]), "03 06 80 00 0B 02 27 19")
+        self.assertEqual(bld510b.format_hex(ser.frames[2]), "03 06 80 00 08 02 27 E9")
+        self.assertEqual(bld510b.format_hex(ser.frames[3]), "03 06 80 00 0D 02 24 B9")
+
     def test_write_rpm_is_best_effort_on_no_response(self):
         ser = FakeSerial(response=b"")
         response = bld510b.write_rpm(ser, 250, device_address=2)

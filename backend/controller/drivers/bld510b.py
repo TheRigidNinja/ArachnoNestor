@@ -25,7 +25,8 @@ STOP_BITS = serial.STOPBITS_ONE if serial is not None else 1  # 1 stop bit
 BYTE_SIZE = serial.EIGHTBITS if serial is not None else 8  # 8 data bits
 TIMEOUT = float(CONFIG["motion"].get("serial_timeout", 0.25))  # Timeout in seconds
 RESPONSE_DELAY = 0.02
-NONBLOCKING_COMMAND_GAP = float(CONFIG["motion"].get("nonblocking_command_gap", 0.02))
+NONBLOCKING_COMMAND_GAP = float(CONFIG["motion"].get("manual_command_gap", CONFIG["motion"].get("nonblocking_command_gap", 0.06)))
+LOG_MODBUS_FRAMES = bool(CONFIG["motion"].get("log_modbus_frames", False))
 
 # Modbus device address
 DEVICE_ADDRESS = CONFIG["motion"]["device_address"]
@@ -50,6 +51,10 @@ def calculate_crc(data):
     return [(crc_value & 0xFF), (crc_value >> 8) & 0xFF]  # Return CRC as [LSB, MSB]
 
 ## ------------------------------------- Function to send a Modbus RTU command with CRC
+def format_hex(data: bytes) -> str:
+    return " ".join(f"{byte:02X}" for byte in data)
+
+
 def _expected_response_length(function_code, count):
     if function_code == 0x06:
         return 8
@@ -83,8 +88,10 @@ def send_modbus_command(
     crc_values = calculate_crc(frame)
     frame.extend(crc_values)
 
-    spaced_string = space_hex_string(frame.hex())
-    log.debug(f"Command sent: {spaced_string}")
+    if LOG_MODBUS_FRAMES:
+        log.info(f"MODBUS TX motor={device_address} fc=0x{function_code:02X} reg=0x{address:04X}: {format_hex(frame)}")
+    else:
+        log.debug(f"Command sent: {space_hex_string(frame.hex())}")
 
     # Detector parity: clear stale bytes before each request.
     try:
@@ -117,17 +124,24 @@ def send_modbus_command(
                 f"reg=0x{address:04X} got={len(response)} expected={expected_len}"
             )
             return None
-        log.debug(f"Response received: {response.hex()}")
+        if LOG_MODBUS_FRAMES:
+            log.info(f"MODBUS RX motor={device_address} fc=0x{function_code:02X} reg=0x{address:04X}: {format_hex(response)}")
+        else:
+            log.debug(f"Response received: {response.hex()}")
         return response
     else:
         key = (device_address, function_code, address)
         now = time.monotonic()
         last = _last_no_response_log.get(key, 0.0)
+        message = (
+            f"MODBUS NO RESPONSE motor={device_address} fc=0x{function_code:02X} "
+            f"reg=0x{address:04X} timeout={TIMEOUT:.3f}s"
+        )
         if now - last >= 2.0:
-            log.warning(f"No response received from motor {device_address} fc=0x{function_code:02X} reg=0x{address:04X}")
+            log.warning(message)
             _last_no_response_log[key] = now
         else:
-            log.debug(f"No response received from motor {device_address} fc=0x{function_code:02X} reg=0x{address:04X}")
+            log.debug(message)
         return None
 
 ## ------------------------------------- Function to format a hex string with spaces

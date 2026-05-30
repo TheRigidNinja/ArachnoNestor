@@ -25,6 +25,7 @@ GAMEPAD_MAPPING_PATH = Path(__file__).resolve().parents[1] / "config" / "gamepad
 GAMEPAD_COMMAND_REFRESH_SEC = 0.35
 GAMEPAD_STOP_REASSERT_SEC = 0.20
 GAMEPAD_WATCHDOG_SEC = 0.25
+MANUAL_FIRST_COMMAND_WAIT_RESPONSE = bool(CONFIG["motion"].get("manual_first_command_wait_response", True))
 GAMEPAD_INPUTS = [
     "axis_0_neg",
     "axis_0_pos",
@@ -381,7 +382,7 @@ class GamepadControl:
                     force_command = is_new_command or refresh_command
                     if mode == "SETUP" and action in {"selected_forward", "selected_up"}:
                         if force_command:
-                            wait_response = False
+                            wait_response = MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
                             force_write = is_new_command
                             log.info(
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
@@ -400,7 +401,7 @@ class GamepadControl:
                             self._last_command_ts = now
                     elif mode == "SETUP" and action in {"selected_reverse", "selected_down"}:
                         if force_command:
-                            wait_response = False
+                            wait_response = MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
                             force_write = is_new_command
                             log.info(
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
