@@ -433,21 +433,42 @@ class GamepadControl:
                             self._last_command_ts = now
                     else:
                         stop_key = (mode, "stop")
+                        previous_command_key = self._last_command_key
+                        previous_was_setup_move = (
+                            isinstance(previous_command_key, tuple)
+                            and len(previous_command_key) == 4
+                            and previous_command_key[0] == "SETUP"
+                            and previous_command_key[2] in {
+                                "selected_forward",
+                                "selected_up",
+                                "selected_reverse",
+                                "selected_down",
+                            }
+                        )
                         if mode == "SETUP":
-                            should_stop = self._last_command_key != stop_key
+                            should_stop = previous_was_setup_move
                         else:
                             should_stop = (
                                 self._last_command_key != stop_key
                                 or (now - self._last_stop_ts) >= GAMEPAD_STOP_REASSERT_SEC
                             )
                         if should_stop:
+                            stop_target = (
+                                previous_command_key[1]
+                                if mode == "SETUP" and previous_was_setup_move
+                                else self.selected_target
+                            )
                             if self._last_command_key != stop_key:
                                 log.info(
-                                    f"GAMEPAD stop mode={mode} target={self.selected_target} "
+                                    f"GAMEPAD stop mode={mode} target={stop_target} "
                                     f"input={snapshot.active_inputs} action={action}"
                                 )
                             if mode == "SETUP":
-                                self.mc.selected_winch_stop(self.selected_target)
+                                self.mc.selected_winch_stop(
+                                    stop_target,
+                                    natural_all_after_brake=False,
+                                    wait_response=True,
+                                )
                             else:
                                 self.mc.manual_action("stop")
                             self._last_command_key = stop_key

@@ -282,8 +282,9 @@ class MotionController:
     def selected_winch_stop(
         self,
         target: int | str,
-        natural_all_after_brake: bool = True,
-        wait_response: bool = False,
+        natural_all_after_brake: bool = False,
+        wait_response: bool = True,
+        natural_after_delay_s: float = 0.4,
     ) -> None:
         target_text = str(target).lower()
         if target_text == "all":
@@ -296,12 +297,23 @@ class MotionController:
 
         for motor_id in brake_targets:
             log.info(f"MOTOR cmd brake-stop motor={motor_id} wait_response={wait_response}")
-            self._stop_motor(motor_id, force=True, wait_response=wait_response, brake=True)
+            stop_response = self._stop_motor(motor_id, force=True, wait_response=wait_response, brake=True)
+            if wait_response and not stop_response:
+                log.error(f"STOP FAILED: no ACK from motor {motor_id}")
 
         if natural_all_after_brake:
+            self._natural_stop_all_after_delay(natural_after_delay_s)
+
+    def _natural_stop_all_after_delay(self, delay_s: float) -> None:
+        delay_s = max(0.3, min(0.5, float(delay_s)))
+
+        def stop_later():
+            time.sleep(delay_s)
             for motor_id in WINCH_IDS:
-                log.info(f"MOTOR cmd natural-stop motor={motor_id} wait_response={wait_response}")
-                self._stop_motor(motor_id, force=True, wait_response=wait_response, brake=False)
+                log.info(f"MOTOR cmd delayed natural-stop motor={motor_id} wait_response=False")
+                self._stop_motor(motor_id, force=True, wait_response=False, brake=False)
+
+        threading.Thread(target=stop_later, daemon=True).start()
 
     def run_balance_loop(
         self,
@@ -538,16 +550,18 @@ class MotionController:
     ):
         state = self._motor_state[motor_id]
         if not force and not state["running"]:
-            return
+            return b""
+        stop_response = None
         try:
             stop_response = self.motor.stop(motor_id, wait_response=wait_response, brake=brake)
             if wait_response and not stop_response:
                 log.warning(f"MOTOR no-ack stop motor={motor_id}")
         except Exception:
-            pass
+            stop_response = None
         state["running"] = False
         state["rpm"] = 0
         state["dir"] = None
+        return stop_response
 
     def _stop_motors(
         self,

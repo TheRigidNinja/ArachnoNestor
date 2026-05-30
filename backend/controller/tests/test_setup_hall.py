@@ -1,6 +1,8 @@
+import io
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 
 from motor.motion_controller import DIRECTION_MAP, HALL_THRESHOLD, STALE_TIMEOUT, WINCH_IDS, MotionController
 from motor.safety import SafetyMonitor
@@ -138,17 +140,37 @@ class TestSetupHall(unittest.TestCase):
         self.assertTrue(mc.motor.last_brake)
         self.assertEqual(mc.mode, "FAULT")
 
-    def test_selected_winch_stop_brakes_target_then_natural_stops_all(self):
+    def test_selected_winch_stop_brakes_target_only_with_ack_debug(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.selected_winch_stop(3)
-        self.assertEqual(mc.motor.stop_calls[0], (3, False, True))
-        self.assertEqual(mc.motor.stop_calls[1:], [
-            (1, False, False),
-            (2, False, False),
-            (3, False, False),
-            (4, False, False),
+        self.assertEqual(mc.motor.stop_calls, [(3, True, True)])
+
+    def test_selected_winch_stop_all_brakes_all_only(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.selected_winch_stop("all")
+        self.assertEqual(mc.motor.stop_calls, [
+            (1, True, True),
+            (2, True, True),
+            (3, True, True),
+            (4, True, True),
         ])
+
+    def test_selected_winch_stop_logs_no_ack(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+
+        def stop_no_ack(motor_id: int | None = None, wait_response: bool = False, brake: bool = False):
+            mc.motor.stop_calls.append((motor_id, wait_response, brake))
+            return None
+
+        mc.motor.stop = stop_no_ack
+        output = io.StringIO()
+        with redirect_stdout(output):
+            mc.selected_winch_stop(2)
+        self.assertEqual(mc.motor.stop_calls, [(2, True, True)])
+        self.assertIn("STOP FAILED: no ACK from motor 2", output.getvalue())
 
     def test_manual_winch_action_force_rewrites_all_commands(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
