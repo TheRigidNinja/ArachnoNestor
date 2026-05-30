@@ -12,6 +12,7 @@ class DummyMotor:
         self.stopped = False
         self.starts = []
         self.stops = []
+        self.stop_calls = []
 
     def write_rpm(self, rpm: int, motor_id: int | None = None, wait_response: bool = True) -> None:
         self.last_rpm = rpm
@@ -33,6 +34,7 @@ class DummyMotor:
         self.last_wait_response = wait_response
         self.last_brake = brake
         self.stops.append(motor_id)
+        self.stop_calls.append((motor_id, wait_response, brake))
         return b"ok"
 
 
@@ -135,6 +137,18 @@ class TestSetupHall(unittest.TestCase):
         self.assertFalse(mc.motor.last_wait_response)
         self.assertTrue(mc.motor.last_brake)
         self.assertEqual(mc.mode, "FAULT")
+
+    def test_selected_winch_stop_brakes_target_then_natural_stops_all(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.selected_winch_stop(3)
+        self.assertEqual(mc.motor.stop_calls[0], (3, False, True))
+        self.assertEqual(mc.motor.stop_calls[1:], [
+            (1, False, False),
+            (2, False, False),
+            (3, False, False),
+            (4, False, False),
+        ])
 
     def test_manual_winch_action_force_rewrites_all_commands(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}

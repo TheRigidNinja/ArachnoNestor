@@ -24,8 +24,8 @@ log = get_logger("app.web_control")
 GAMEPAD_MAPPING_PATH = Path(__file__).resolve().parents[1] / "config" / "gamepad_mapping.json"
 GAMEPAD_COMMAND_REFRESH_SEC = 0.35
 GAMEPAD_STOP_REASSERT_SEC = 0.20
-GAMEPAD_WATCHDOG_SEC = 0.25
-MANUAL_FIRST_COMMAND_WAIT_RESPONSE = bool(CONFIG["motion"].get("manual_first_command_wait_response", True))
+GAMEPAD_WATCHDOG_SEC = 0.75
+MANUAL_FIRST_COMMAND_WAIT_RESPONSE = bool(CONFIG["motion"].get("manual_first_command_wait_response", False))
 GAMEPAD_INPUTS = [
     "axis_0_neg",
     "axis_0_pos",
@@ -228,7 +228,11 @@ class GamepadControl:
 
     def _stop_motors_now(self):
         try:
-            self.mc.manual_action("stop")
+            mode = self.mc.get_status().get("mode")
+            if mode == "SETUP":
+                self.mc.selected_winch_stop(self.selected_target)
+            else:
+                self.mc.manual_action("stop")
         except Exception:
             pass
         now = time.monotonic()
@@ -429,17 +433,23 @@ class GamepadControl:
                             self._last_command_ts = now
                     else:
                         stop_key = (mode, "stop")
-                        should_stop = (
-                            self._last_command_key != stop_key
-                            or (now - self._last_stop_ts) >= GAMEPAD_STOP_REASSERT_SEC
-                        )
+                        if mode == "SETUP":
+                            should_stop = self._last_command_key != stop_key
+                        else:
+                            should_stop = (
+                                self._last_command_key != stop_key
+                                or (now - self._last_stop_ts) >= GAMEPAD_STOP_REASSERT_SEC
+                            )
                         if should_stop:
                             if self._last_command_key != stop_key:
                                 log.info(
                                     f"GAMEPAD stop mode={mode} target={self.selected_target} "
                                     f"input={snapshot.active_inputs} action={action}"
                                 )
-                            self.mc.manual_action("stop")
+                            if mode == "SETUP":
+                                self.mc.selected_winch_stop(self.selected_target)
+                            else:
+                                self.mc.manual_action("stop")
                             self._last_command_key = stop_key
                             self._last_command_ts = now
                             self._last_stop_ts = now

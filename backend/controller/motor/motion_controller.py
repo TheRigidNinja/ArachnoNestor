@@ -279,6 +279,30 @@ class MotionController:
             wait_response=wait_response,
         )
 
+    def selected_winch_stop(
+        self,
+        target: int | str,
+        natural_all_after_brake: bool = True,
+        wait_response: bool = False,
+    ) -> None:
+        target_text = str(target).lower()
+        if target_text == "all":
+            brake_targets = list(WINCH_IDS)
+        else:
+            winch_id = int(target)
+            if winch_id not in WINCH_IDS:
+                raise ValueError("invalid winch id")
+            brake_targets = [winch_id]
+
+        for motor_id in brake_targets:
+            log.info(f"MOTOR cmd brake-stop motor={motor_id} wait_response={wait_response}")
+            self._stop_motor(motor_id, force=True, wait_response=wait_response, brake=True)
+
+        if natural_all_after_brake:
+            for motor_id in WINCH_IDS:
+                log.info(f"MOTOR cmd natural-stop motor={motor_id} wait_response={wait_response}")
+                self._stop_motor(motor_id, force=True, wait_response=wait_response, brake=False)
+
     def run_balance_loop(
         self,
         base_rpm: float = 1000.0,
