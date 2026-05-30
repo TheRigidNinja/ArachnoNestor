@@ -27,10 +27,11 @@ class DummyMotor:
         self.starts.append((motor_id, direction))
         return b"ok"
 
-    def stop(self, motor_id: int | None = None, wait_response: bool = False) -> None:
+    def stop(self, motor_id: int | None = None, wait_response: bool = False, brake: bool = False) -> None:
         self.stopped = True
         self.last_motor_id = motor_id
         self.last_wait_response = wait_response
+        self.last_brake = brake
         self.stops.append(motor_id)
         return b"ok"
 
@@ -123,7 +124,17 @@ class TestSetupHall(unittest.TestCase):
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.stop_all("operator stop")
         self.assertEqual(mc.motor.stops, [1, 2, 3, 4])
-        self.assertTrue(mc.motor.last_wait_response)
+        self.assertFalse(mc.motor.last_wait_response)
+        self.assertFalse(mc.motor.last_brake)
+
+    def test_emergency_stop_uses_brake_without_waiting(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.emergency_stop("test emergency")
+        self.assertEqual(mc.motor.stops, [1, 2, 3, 4])
+        self.assertFalse(mc.motor.last_wait_response)
+        self.assertTrue(mc.motor.last_brake)
+        self.assertEqual(mc.mode, "FAULT")
 
     def test_manual_winch_action_force_rewrites_all_commands(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}

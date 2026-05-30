@@ -386,8 +386,10 @@ class MotorBus:
         with self._io_lock:
             return start_motorFR(self.ser, direction, device_address=motor_id, wait_response=wait_response)
 
-    def stop(self, motor_id: int | None = None, wait_response: bool = False):
+    def stop(self, motor_id: int | None = None, wait_response: bool = False, brake: bool = False):
         with self._io_lock:
+            if brake:
+                return stop_motor_braking(self.ser, device_address=motor_id, wait_response=wait_response)
             return stop_motor_natural(self.ser, device_address=motor_id, wait_response=wait_response)
 
     def close(self):
@@ -412,7 +414,7 @@ class DisabledMotorBus:
     def start(self, direction: str, motor_id: int | None = None, wait_response: bool = True):
         self._raise_unavailable()
 
-    def stop(self, motor_id: int | None = None, wait_response: bool = False):
+    def stop(self, motor_id: int | None = None, wait_response: bool = False, brake: bool = False):
         return None
 
     def close(self):

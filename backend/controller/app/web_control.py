@@ -24,6 +24,7 @@ log = get_logger("app.web_control")
 GAMEPAD_MAPPING_PATH = Path(__file__).resolve().parents[1] / "config" / "gamepad_mapping.json"
 GAMEPAD_COMMAND_REFRESH_SEC = 0.35
 GAMEPAD_STOP_REASSERT_SEC = 0.20
+GAMEPAD_WATCHDOG_SEC = 0.25
 GAMEPAD_INPUTS = [
     "axis_0_neg",
     "axis_0_pos",
@@ -127,6 +128,7 @@ class GamepadControl:
         self.mc = motion_controller
         self._lock = threading.Lock()
         self._thread = None
+        self._watchdog_thread = None
         self._stop = threading.Event()
         self.active = False
         self.controller_name = None
@@ -175,6 +177,9 @@ class GamepadControl:
             self.last_error = None
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
+            if self._watchdog_thread is None or not self._watchdog_thread.is_alive():
+                self._watchdog_thread = threading.Thread(target=self._watchdog, daemon=True)
+                self._watchdog_thread.start()
 
     def set_target(self, target: int | str):
         target_text = str(target).lower()
@@ -211,7 +216,7 @@ class GamepadControl:
         try:
             self.mc.manual_action("stop")
         except Exception:
-                    pass
+            pass
         if disable_monitor:
             with self._lock:
                 self.active = False
@@ -219,6 +224,30 @@ class GamepadControl:
         self._last_command_key = None
         self._last_command_ts = 0.0
         self._last_stop_ts = 0.0
+
+    def _stop_motors_now(self):
+        try:
+            self.mc.manual_action("stop")
+        except Exception:
+            pass
+        now = time.monotonic()
+        with self._lock:
+            self.last_action = "stop"
+            self._last_command_key = ("watchdog", "stop")
+            self._last_command_ts = now
+            self._last_stop_ts = now
+
+    def _watchdog(self):
+        while not self._stop.is_set():
+            with self._lock:
+                active = self.active
+                last_update = self.last_update
+                last_action = self.last_action
+            stale = last_update is not None and (time.time() - last_update) > GAMEPAD_WATCHDOG_SEC
+            if active and stale and last_action != "stop":
+                log.warning("GAMEPAD watchdog stop: controller input stale")
+                self._stop_motors_now()
+            time.sleep(0.05)
 
     def _input_values(self, snapshot):
         values = {input_name: 0 for input_name in GAMEPAD_INPUTS}
@@ -352,7 +381,7 @@ class GamepadControl:
                     force_command = is_new_command or refresh_command
                     if mode == "SETUP" and action in {"selected_forward", "selected_up"}:
                         if force_command:
-                            wait_response = is_new_command
+                            wait_response = False
                             force_write = is_new_command
                             log.info(
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
@@ -371,7 +400,7 @@ class GamepadControl:
                             self._last_command_ts = now
                     elif mode == "SETUP" and action in {"selected_reverse", "selected_down"}:
                         if force_command:
-                            wait_response = is_new_command
+                            wait_response = False
                             force_write = is_new_command
                             log.info(
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
@@ -394,7 +423,7 @@ class GamepadControl:
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
                                 f"input={snapshot.active_inputs} action={action} rpm={rpm}"
                             )
-                            self.mc.manual_action(action, rpm=rpm)
+                            self.mc.manual_action(action, rpm=rpm, wait_response=False)
                             self._last_command_key = command_key
                             self._last_command_ts = now
                     else:

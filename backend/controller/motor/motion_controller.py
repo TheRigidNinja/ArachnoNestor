@@ -161,10 +161,16 @@ class MotionController:
             self.setup_activated = False
             self._stop_motors_locked("fault cleared", force=True)
 
-    def stop_all(self, reason: str = "user stop", as_fault: bool = False) -> None:
+    def stop_all(
+        self,
+        reason: str = "user stop",
+        as_fault: bool = False,
+        wait_response: bool = False,
+        brake: bool = False,
+    ) -> None:
         """Stop motors. If as_fault=True, enter FAULT mode and record reason."""
         with self._lock:
-            self._stop_motors_locked(reason, force=True)
+            self._stop_motors_locked(reason, force=True, wait_response=wait_response, brake=brake)
             self._allow_hall_below = False
             if as_fault:
                 self.fault = reason if self.fault is None else self.fault
@@ -172,7 +178,7 @@ class MotionController:
 
     def emergency_stop(self, reason: str = "emergency stop") -> None:
         """Force-stop and enter FAULT regardless of current state."""
-        self.stop_all(reason=reason, as_fault=True)
+        self.stop_all(reason=reason, as_fault=True, wait_response=False, brake=True)
 
     def setup_jog(self, rpm: int = 200, seconds: float = 1.0) -> str:
         with self._lock:
@@ -222,16 +228,16 @@ class MotionController:
                 raise RuntimeError(f"directional tests blocked: {status.reason}")
         return self._start_job(targets=DIRECTION_MAP[name], rpm=rpm, seconds=seconds, label=f"dir_{name}")
 
-    def manual_action(self, action: str, rpm: int = 250) -> None:
+    def manual_action(self, action: str, rpm: int = 250, wait_response: bool = True) -> None:
         action = action.lower()
         if action in {"", "none", "stop"}:
-            self.stop_all("manual controller stop")
+            self.stop_all("manual controller stop", wait_response=False)
             return
         if action not in DIRECTION_MAP:
             raise ValueError("invalid manual action")
         with self._lock:
             self._ensure_ready("TEST")
-        self._command_motors(DIRECTION_MAP[action], rpm)
+        self._command_motors(DIRECTION_MAP[action], rpm, wait_response=wait_response)
 
     def manual_winch_action(
         self,
@@ -244,7 +250,7 @@ class MotionController:
     ) -> None:
         direction = direction.lower()
         if direction in {"", "none", "stop"}:
-            self.stop_all("manual controller stop")
+            self.stop_all("manual controller stop", wait_response=False)
             return
         if direction not in {"forward", "reverse"}:
             raise ValueError("invalid winch direction")
@@ -474,7 +480,7 @@ class MotionController:
                     continue
                 if force:
                     log.info(f"MOTOR cmd stop motor={motor_id} force={force}")
-                self._stop_motor(motor_id, force=force)
+                self._stop_motor(motor_id, force=force, wait_response=wait_response)
                 continue
             desired_dir = "F" if direction > 0 else "R"
             command_failed = False
@@ -499,13 +505,19 @@ class MotionController:
             state["dir"] = desired_dir
             state["running"] = True
 
-    def _stop_motor(self, motor_id: int, force: bool = False):
+    def _stop_motor(
+        self,
+        motor_id: int,
+        force: bool = False,
+        wait_response: bool = False,
+        brake: bool = False,
+    ):
         state = self._motor_state[motor_id]
         if not force and not state["running"]:
             return
         try:
-            stop_response = self.motor.stop(motor_id, wait_response=force)
-            if force and not stop_response:
+            stop_response = self.motor.stop(motor_id, wait_response=wait_response, brake=brake)
+            if wait_response and not stop_response:
                 log.warning(f"MOTOR no-ack stop motor={motor_id}")
         except Exception:
             pass
@@ -513,13 +525,25 @@ class MotionController:
         state["rpm"] = 0
         state["dir"] = None
 
-    def _stop_motors(self, reason: str = "", force: bool = False):
+    def _stop_motors(
+        self,
+        reason: str = "",
+        force: bool = False,
+        wait_response: bool = False,
+        brake: bool = False,
+    ):
         with self._lock:
-            self._stop_motors_locked(reason, force=force)
+            self._stop_motors_locked(reason, force=force, wait_response=wait_response, brake=brake)
 
-    def _stop_motors_locked(self, reason: str = "", force: bool = False):
+    def _stop_motors_locked(
+        self,
+        reason: str = "",
+        force: bool = False,
+        wait_response: bool = False,
+        brake: bool = False,
+    ):
         for mid in WINCH_IDS:
-            self._stop_motor(mid, force=force)
+            self._stop_motor(mid, force=force, wait_response=wait_response, brake=brake)
 
     def _can_move_locked(self) -> bool:
         # caller must hold lock

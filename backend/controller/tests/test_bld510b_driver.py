@@ -43,6 +43,15 @@ class TestBLD510BDriver(unittest.TestCase):
         self.assertEqual(ser.frames[0][2:4], b"\x80\x00")
         self.assertEqual(ser.frames[0][4:6], b"\x08\x02")
 
+    def test_braking_stop_sends_addressed_brake_frame(self):
+        ser = FakeSerial()
+        bld510b.stop_motor_braking(ser, device_address=2)
+        self.assertEqual(ser.read_calls, 0)
+        self.assertEqual(ser.frames[0][0], 2)
+        self.assertEqual(ser.frames[0][1], 0x06)
+        self.assertEqual(ser.frames[0][2:4], b"\x80\x00")
+        self.assertEqual(ser.frames[0][4:6], b"\x0D\x02")
+
     def test_write_rpm_is_best_effort_on_no_response(self):
         ser = FakeSerial(response=b"")
         response = bld510b.write_rpm(ser, 250, device_address=2)
