@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import sys
 import threading
 from pathlib import Path
 
 # ensure repo root on sys.path when running from app/
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = REPO_ROOT / "venv" / "bin" / "python"
+if (
+    VENV_PYTHON.exists()
+    and Path(sys.executable).resolve() != VENV_PYTHON.resolve()
+    and os.environ.get("ARACHNO_SKIP_VENV_BOOTSTRAP") != "1"
+):
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -33,7 +42,7 @@ TIMEOUT = 1
 def main(argv=None):
     argv = list(argv) if argv is not None else sys.argv[1:]
 
-    ap = argparse.ArgumentParser(description="Web UI + supervisor + IMU balance loop")
+    ap = argparse.ArgumentParser(description="Web UI + supervisor")
     ap.add_argument("--host", default=ESP_IP, help="ESP32 IMU host")
     ap.add_argument("--port", type=int, default=ESP_PORT, help="ESP32 IMU port")
     ap.add_argument("--timeout", type=float, default=TIMEOUT_SEC, help="ESP32 IMU socket timeout")
@@ -43,29 +52,41 @@ def main(argv=None):
     ap.add_argument("--backoff", type=float, default=BACKOFF, help="multiplier on device timeout")
     ap.add_argument("--recover", type=float, default=RECOVER, help="multiplier to speed up after success")
     ap.add_argument("--base-rpm", type=float, default=1000.0, help="baseline RPM before PID correction")
+    ap.add_argument(
+        "--enable-balance-loop",
+        action="store_true",
+        help="enable automatic IMU balance loop (disabled by default)",
+    )
     ap.add_argument("--no-motors", action="store_true", help="run loop without commanding motors")
     ap.add_argument("--serial", default=SERIAL_PORT, help="RS485 serial port for motors")
     args = ap.parse_args(argv)
 
-    controller = get_controller()
+    controller = get_controller(
+        serial_port=args.serial,
+        no_motors=args.no_motors,
+        host=args.host,
+        port=args.port,
+        timeout=args.timeout,
+    )
 
-    # Balance loop runs in background; web UI runs in main thread.
-    def _balance():
-        controller.run_balance_loop(
-            base_rpm=args.base_rpm,
-            sample_hz=args.sample_hz,
-            min_interval=args.min_interval,
-            max_interval=args.max_interval,
-            backoff=args.backoff,
-            recover=args.recover,
-            no_motors=args.no_motors,
-            host=args.host,
-            port=args.port,
-            timeout=args.timeout,
-        )
+    if args.enable_balance_loop:
+        # Balance loop runs in background; web UI runs in main thread.
+        def _balance():
+            controller.run_balance_loop(
+                base_rpm=args.base_rpm,
+                sample_hz=args.sample_hz,
+                min_interval=args.min_interval,
+                max_interval=args.max_interval,
+                backoff=args.backoff,
+                recover=args.recover,
+                no_motors=args.no_motors,
+                host=args.host,
+                port=args.port,
+                timeout=args.timeout,
+            )
 
-    bal_thread = threading.Thread(target=_balance, daemon=True)
-    bal_thread.start()
+        bal_thread = threading.Thread(target=_balance, daemon=True)
+        bal_thread.start()
 
     from app.web_control import main as web_main
     return web_main() or 0

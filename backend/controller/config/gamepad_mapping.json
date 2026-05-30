@@ -1,0 +1,32 @@
+{
+  "enabled": true,
+  "inputs": {
+    "axis_0_neg": "none",
+    "axis_0_pos": "none",
+    "axis_1_neg": "none",
+    "axis_1_pos": "none",
+    "axis_2_neg": "none",
+    "axis_2_pos": "none",
+    "axis_3_neg": "none",
+    "axis_3_pos": "none",
+    "axis_4_neg": "none",
+    "axis_4_pos": "none",
+    "axis_5_neg": "none",
+    "axis_5_pos": "none",
+    "button_0": "selected_down",
+    "button_1": "none",
+    "button_2": "none",
+    "button_3": "selected_up",
+    "button_4": "none",
+    "button_5": "none",
+    "button_6": "previous_winch",
+    "button_7": "next_winch",
+    "button_8": "none",
+    "button_9": "up",
+    "dpad_down": "none",
+    "dpad_left": "none",
+    "dpad_right": "none",
+    "dpad_up": "stop"
+  },
+  "rpm": 150
+}

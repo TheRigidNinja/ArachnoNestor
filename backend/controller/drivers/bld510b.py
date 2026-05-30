@@ -1,6 +1,13 @@
-import serial
+import threading
 import time
-from crcmod import crcmod  # Install using: pip install crcmod
+try:
+    import serial
+except ImportError:
+    serial = None
+try:
+    from crcmod import crcmod  # Install using: pip install crcmod
+except ImportError:
+    crcmod = None
 
 from config.settings import load_config
 from logutil.logger import get_logger
@@ -8,14 +15,17 @@ from logutil.logger import get_logger
 CONFIG = load_config()
 
 log = get_logger("drivers.bld510b")
+_last_no_response_log = {}
 
 # RS485 configuration
 SERIAL_PORT = CONFIG["motion"]["serial_port"]
 BAUD_RATE = CONFIG["motion"]["baud_rate"]
-PARITY = serial.PARITY_NONE   # No parity
-STOP_BITS = serial.STOPBITS_ONE  # 1 stop bit
-BYTE_SIZE = serial.EIGHTBITS  # 8 data bits
-TIMEOUT = 1                   # Timeout in seconds
+PARITY = serial.PARITY_NONE if serial is not None else "N"  # No parity
+STOP_BITS = serial.STOPBITS_ONE if serial is not None else 1  # 1 stop bit
+BYTE_SIZE = serial.EIGHTBITS if serial is not None else 8  # 8 data bits
+TIMEOUT = float(CONFIG["motion"].get("serial_timeout", 0.25))  # Timeout in seconds
+RESPONSE_DELAY = 0.02
+NONBLOCKING_COMMAND_GAP = float(CONFIG["motion"].get("nonblocking_command_gap", 0.02))
 
 # Modbus device address
 DEVICE_ADDRESS = CONFIG["motion"]["device_address"]
@@ -25,15 +35,42 @@ MOTOR_POLES_PAIRS = 2  # Number of poles in the motor
 
 ## ------------------------------------- CRC calculation function
 def calculate_crc(data):
-    crc16 = crcmod.mkCrcFun(0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000)
-    crc_value = crc16(data)
+    if crcmod is not None:
+        crc16 = crcmod.mkCrcFun(0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000)
+        crc_value = crc16(data)
+    else:
+        crc_value = 0xFFFF
+        for byte in data:
+            crc_value ^= byte
+            for _ in range(8):
+                if crc_value & 1:
+                    crc_value = (crc_value >> 1) ^ 0xA001
+                else:
+                    crc_value >>= 1
     return [(crc_value & 0xFF), (crc_value >> 8) & 0xFF]  # Return CRC as [LSB, MSB]
 
 ## ------------------------------------- Function to send a Modbus RTU command with CRC
-def send_modbus_command(ser, function_code, address, value=None, count=None):
+def _expected_response_length(function_code, count):
+    if function_code == 0x06:
+        return 8
+    if function_code == 0x03 and count is not None:
+        return 5 + (2 * int(count))
+    return None
+
+
+def send_modbus_command(
+    ser,
+    function_code,
+    address,
+    value=None,
+    count=None,
+    device_address=None,
+    wait_response=True,
+):
+    device_address = DEVICE_ADDRESS if device_address is None else int(device_address)
     # Build the Modbus RTU frame
     frame = bytearray()
-    frame.append(DEVICE_ADDRESS)  # Slave address
+    frame.append(device_address)  # Slave address
     frame.append(function_code)  # Function code
     frame.extend(address.to_bytes(2, byteorder='big'))  # Register address
 
@@ -49,17 +86,48 @@ def send_modbus_command(ser, function_code, address, value=None, count=None):
     spaced_string = space_hex_string(frame.hex())
     log.debug(f"Command sent: {spaced_string}")
 
+    # Detector parity: clear stale bytes before each request.
+    try:
+        ser.reset_input_buffer()
+    except Exception:
+        pass
+
     # Send the command
     ser.write(frame)
+    try:
+        ser.flush()
+    except Exception:
+        pass
 
-    # Wait for a response (adjust the sleep time if necessary)
-    time.sleep(0.15)
-    response = ser.read_all()
+    if not wait_response:
+        time.sleep(NONBLOCKING_COMMAND_GAP)
+        return b""
+
+    expected_len = _expected_response_length(function_code, count)
+    if expected_len is None:
+        time.sleep(RESPONSE_DELAY)
+        response = ser.read_all()
+    else:
+        response = ser.read(expected_len)
+
     if response:
+        if expected_len is not None and len(response) < expected_len:
+            log.warning(
+                f"Short response from motor {device_address} fc=0x{function_code:02X} "
+                f"reg=0x{address:04X} got={len(response)} expected={expected_len}"
+            )
+            return None
         log.debug(f"Response received: {response.hex()}")
         return response
     else:
-        log.warning("No response received")
+        key = (device_address, function_code, address)
+        now = time.monotonic()
+        last = _last_no_response_log.get(key, 0.0)
+        if now - last >= 2.0:
+            log.warning(f"No response received from motor {device_address} fc=0x{function_code:02X} reg=0x{address:04X}")
+            _last_no_response_log[key] = now
+        else:
+            log.debug(f"No response received from motor {device_address} fc=0x{function_code:02X} reg=0x{address:04X}")
         return None
 
 ## ------------------------------------- Function to format a hex string with spaces
@@ -68,23 +136,31 @@ def space_hex_string(hex_string):
     return spaced_hex
 
 ## ------------------------------------- Function to start the motor in forward or reverse direction
-def start_motorFR(ser, FR):
+def start_motorFR(ser, FR, device_address=None, wait_response=True):
     if FR == "F":
-        send_modbus_command(ser, 0x06, 0x8000, 0x0902)  # Forward
+        return send_modbus_command(
+            ser, 0x06, 0x8000, 0x0902, device_address=device_address, wait_response=wait_response
+        )  # Forward
     else:
-        send_modbus_command(ser, 0x06, 0x8000, 0x0B02)  # Reverse
+        return send_modbus_command(
+            ser, 0x06, 0x8000, 0x0B02, device_address=device_address, wait_response=wait_response
+        )  # Reverse
 
 ## ------------------------------------- Function to stop the motor (natural stop)
-def stop_motor_natural(ser):
-    print("Stopping motor naturally...")
-    send_modbus_command(ser, 0x06, 0x8000, 0x0802)
+def stop_motor_natural(ser, device_address=None, wait_response=False):
+    log.debug("Stopping motor naturally...")
+    return send_modbus_command(
+        ser, 0x06, 0x8000, 0x0802, device_address=device_address, wait_response=wait_response
+    )
 
 ## -------------------------------------  Function to stop the motor (braking stop)
-def stop_motor_braking(ser):
-    send_modbus_command(ser, 0x06, 0x8000, 0x0D02)
+def stop_motor_braking(ser, device_address=None, wait_response=False):
+    return send_modbus_command(
+        ser, 0x06, 0x8000, 0x0D02, device_address=device_address, wait_response=wait_response
+    )
 
 ## ------------------------------------- Function to write speed (RPM)
-def write_rpm(ser, speed):
+def write_rpm(ser, speed, device_address=None, wait_response=True):
     # Ensure speed is within valid range (0–4000 RPM)
     if speed < 0 or speed > 4000:
         log.error("Speed must be between 0 and 4000 RPM")
@@ -100,15 +176,20 @@ def write_rpm(ser, speed):
     # Combine the low and high bytes into a single 16-bit value (little-endian)
     speed_combined = (speed_low_byte << 8) | speed_high_byte
 
-    log.info(f"Setting speed to {speed} RPM (0x{speed_combined:04X})")
+    log.debug(f"Setting speed to {speed} RPM (0x{speed_combined:04X})")
 
     # Send the command
-    response = send_modbus_command(ser, 0x06, 0x8005, speed_combined)
-    
+    response = send_modbus_command(
+        ser, 0x06, 0x8005, speed_combined, device_address=device_address, wait_response=wait_response
+    )
+
+    if not wait_response:
+        return response
     if response:
-        log.info(f"Speed set to {speed} RPM successfully.")
+        log.debug(f"Speed set to {speed} RPM successfully.")
     else:
-        log.error("Failed to set speed. Check wiring and Modbus address.")
+        log.warning(f"Failed to set speed for motor {device_address or DEVICE_ADDRESS}. Check wiring and Modbus address.")
+    return response
 
 
 ## ------------------------------------- Function to read real speed (RPM)
@@ -283,6 +364,8 @@ class MotorBus:
     """Simple driver wrapper that owns the serial connection."""
 
     def __init__(self, port: str | None = None, baudrate: int | None = None):
+        if serial is None:
+            raise RuntimeError("pyserial is not installed; activate venv or install pyserial")
         port = port or SERIAL_PORT
         baudrate = baudrate or BAUD_RATE
         self.ser = serial.Serial(
@@ -293,21 +376,47 @@ class MotorBus:
             bytesize=BYTE_SIZE,
             timeout=TIMEOUT,
         )
+        self._io_lock = threading.Lock()
 
-    def write_rpm(self, rpm: int):
-        return write_rpm(self.ser, rpm)
+    def write_rpm(self, rpm: int, motor_id: int | None = None, wait_response: bool = True):
+        with self._io_lock:
+            return write_rpm(self.ser, rpm, device_address=motor_id, wait_response=wait_response)
 
-    def start(self, direction: str):
-        return start_motorFR(self.ser, direction)
+    def start(self, direction: str, motor_id: int | None = None, wait_response: bool = True):
+        with self._io_lock:
+            return start_motorFR(self.ser, direction, device_address=motor_id, wait_response=wait_response)
 
-    def stop(self):
-        return stop_motor_natural(self.ser)
+    def stop(self, motor_id: int | None = None, wait_response: bool = False):
+        with self._io_lock:
+            return stop_motor_natural(self.ser, device_address=motor_id, wait_response=wait_response)
 
     def close(self):
         try:
             self.ser.close()
         except Exception:
             pass
+
+
+class DisabledMotorBus:
+    """Motor bus placeholder used when the RS485 adapter is unavailable."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def _raise_unavailable(self):
+        raise RuntimeError(f"motor RS485 unavailable: {self.reason}")
+
+    def write_rpm(self, rpm: int, motor_id: int | None = None, wait_response: bool = True):
+        self._raise_unavailable()
+
+    def start(self, direction: str, motor_id: int | None = None, wait_response: bool = True):
+        self._raise_unavailable()
+
+    def stop(self, motor_id: int | None = None, wait_response: bool = False):
+        return None
+
+    def close(self):
+        return None
 
 
 

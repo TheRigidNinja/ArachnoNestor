@@ -3,6 +3,19 @@
 from __future__ import annotations
 
 import time
+import os
+
+
+LEVELS = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARN": 30,
+    "ERROR": 40,
+}
+
+
+def _min_level() -> int:
+    return LEVELS.get(os.environ.get("ARACHNO_LOG_LEVEL", "INFO").upper(), LEVELS["INFO"])
 
 
 class Logger:
@@ -10,6 +23,8 @@ class Logger:
         self.name = name
 
     def _log(self, level: str, msg: str):
+        if LEVELS[level] < _min_level():
+            return
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"{ts} [{level}] {self.name}: {msg}")
 

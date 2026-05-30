@@ -2,20 +2,90 @@
 """Minimal Flask web UI for supervisor control."""
 
 import json
+import logging
+import threading
 import time
+from pathlib import Path
 
 from flask import Flask, Response, jsonify, request
 
 from config.settings import load_config
 from drivers.evb_driver import EVBDriver
-from motor.motion_controller import get_controller, DIRECTION_MAP
+from drivers.gamepad import GamepadReader
+from motor.motion_controller import get_controller, DIRECTION_MAP, WINCH_IDS
 from logutil.logger import get_logger
 
 CONFIG = load_config()
 
 app = Flask(__name__)
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 mc = get_controller()
 log = get_logger("app.web_control")
+GAMEPAD_MAPPING_PATH = Path(__file__).resolve().parents[1] / "config" / "gamepad_mapping.json"
+GAMEPAD_COMMAND_REFRESH_SEC = 0.35
+GAMEPAD_STOP_REASSERT_SEC = 0.20
+GAMEPAD_INPUTS = [
+    "axis_0_neg",
+    "axis_0_pos",
+    "axis_1_neg",
+    "axis_1_pos",
+    "axis_2_neg",
+    "axis_2_pos",
+    "axis_3_neg",
+    "axis_3_pos",
+    "axis_4_neg",
+    "axis_4_pos",
+    "axis_5_neg",
+    "axis_5_pos",
+    "dpad_up",
+    "dpad_down",
+    "dpad_left",
+    "dpad_right",
+    "button_0",
+    "button_1",
+    "button_2",
+    "button_3",
+    "button_4",
+    "button_5",
+    "button_6",
+    "button_7",
+    "button_8",
+    "button_9",
+]
+GAMEPAD_ACTIONS = [
+    "none",
+    "selected_up",
+    "selected_down",
+    "selected_forward",
+    "selected_reverse",
+    "previous_winch",
+    "next_winch",
+    "up",
+    "down",
+    "forward",
+    "back",
+    "left",
+    "right",
+    "stop",
+]
+DEFAULT_GAMEPAD_MAPPING = {
+    "enabled": True,
+    "rpm": 250,
+    "inputs": {
+        "axis_2_pos": "none",
+        "axis_5_pos": "none",
+        "button_0": "selected_down",
+        "button_1": "none",
+        "button_2": "none",
+        "button_3": "selected_up",
+        "button_6": "previous_winch",
+        "button_7": "next_winch",
+        "dpad_up": "none",
+        "dpad_down": "none",
+        "dpad_left": "none",
+        "dpad_right": "none",
+    },
+}
 
 
 # ---------- helpers ----------
@@ -25,6 +95,371 @@ def ok(data=None):
 
 def err(msg):
     return jsonify({"ok": False, "error": msg}), 400
+
+
+def load_gamepad_mapping():
+    try:
+        with GAMEPAD_MAPPING_PATH.open("r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except Exception:
+        loaded = {}
+    mapping = {
+        "enabled": bool(loaded.get("enabled", DEFAULT_GAMEPAD_MAPPING["enabled"])),
+        "rpm": int(loaded.get("rpm", DEFAULT_GAMEPAD_MAPPING["rpm"])),
+        "inputs": DEFAULT_GAMEPAD_MAPPING["inputs"].copy(),
+    }
+    if isinstance(loaded.get("inputs"), dict):
+        for input_name, action in loaded["inputs"].items():
+            if input_name in GAMEPAD_INPUTS and action in GAMEPAD_ACTIONS:
+                mapping["inputs"][input_name] = action
+    return mapping
+
+
+def save_gamepad_mapping(mapping):
+    GAMEPAD_MAPPING_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with GAMEPAD_MAPPING_PATH.open("w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+class GamepadControl:
+    def __init__(self, motion_controller):
+        self.mc = motion_controller
+        self._lock = threading.Lock()
+        self._thread = None
+        self._stop = threading.Event()
+        self.active = False
+        self.controller_name = None
+        self.last_inputs = []
+        self.last_action = "stop"
+        self.last_error = None
+        self.last_update = None
+        self.axes = []
+        self.buttons = []
+        self.hats = []
+        self.input_values = {input_name: 0 for input_name in GAMEPAD_INPUTS}
+        self._last_start_attempt = 0.0
+        self._monitor_disabled = False
+        self.selected_target = "1"
+        self._previous_inputs = set()
+        self.last_probe = []
+        self._last_command_key = None
+        self._last_command_ts = 0.0
+        self._last_stop_ts = 0.0
+        self._last_block_reason = None
+
+    def status(self):
+        with self._lock:
+            return {
+                "active": self.active,
+                "controller_name": self.controller_name,
+                "last_inputs": list(self.last_inputs),
+                "last_action": self.last_action,
+                "last_error": self.last_error,
+                "last_update": self.last_update,
+                "axes": list(self.axes),
+                "buttons": list(self.buttons),
+                "hats": [list(hat) for hat in self.hats],
+                "input_values": dict(self.input_values),
+                "selected_target": self.selected_target,
+                "last_probe": list(self.last_probe),
+            }
+
+    def start(self):
+        with self._lock:
+            self._monitor_disabled = False
+            self._last_start_attempt = time.time()
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self.last_error = None
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def set_target(self, target: int | str):
+        target_text = str(target).lower()
+        valid_targets = [str(winch_id) for winch_id in WINCH_IDS] + ["all"]
+        if target_text not in valid_targets:
+            raise ValueError("invalid controller target")
+        with self._lock:
+            self.selected_target = target_text
+
+    def _cycle_target(self, step: int):
+        valid_targets = [str(winch_id) for winch_id in WINCH_IDS] + ["all"]
+        with self._lock:
+            current = self.selected_target
+            if current not in valid_targets:
+                self.selected_target = valid_targets[0 if step > 0 else -1]
+                return
+            index = valid_targets.index(current)
+            self.selected_target = valid_targets[(index + step) % len(valid_targets)]
+
+    def ensure_started(self, retry_seconds: float = 2.0):
+        with self._lock:
+            if self._monitor_disabled:
+                return
+            thread_alive = self._thread is not None and self._thread.is_alive()
+            recently_tried = (time.time() - self._last_start_attempt) < retry_seconds
+        if not thread_alive and not recently_tried:
+            self.start()
+
+    def stop(self, disable_monitor: bool = False):
+        if disable_monitor:
+            with self._lock:
+                self._monitor_disabled = True
+            self._stop.set()
+        try:
+            self.mc.manual_action("stop")
+        except Exception:
+                    pass
+        if disable_monitor:
+            with self._lock:
+                self.active = False
+                self.last_action = "stop"
+        self._last_command_key = None
+        self._last_command_ts = 0.0
+        self._last_stop_ts = 0.0
+
+    def _input_values(self, snapshot):
+        values = {input_name: 0 for input_name in GAMEPAD_INPUTS}
+        for index, value in enumerate(snapshot.axes):
+            neg_name = f"axis_{index}_neg"
+            pos_name = f"axis_{index}_pos"
+            if neg_name in values:
+                values[neg_name] = value if value < -0.5 else 0
+            if pos_name in values:
+                values[pos_name] = value if value > 0.5 else 0
+        for index, value in enumerate(snapshot.buttons):
+            input_name = f"button_{index}"
+            if input_name in values:
+                values[input_name] = int(value)
+        for index, (x_value, y_value) in enumerate(snapshot.hats):
+            prefix = "dpad" if index == 0 else f"dpad{index}"
+            directions = {
+                f"{prefix}_up": 1 if y_value > 0 else 0,
+                f"{prefix}_down": 1 if y_value < 0 else 0,
+                f"{prefix}_right": 1 if x_value > 0 else 0,
+                f"{prefix}_left": 1 if x_value < 0 else 0,
+            }
+            for input_name, value in directions.items():
+                if input_name in values:
+                    values[input_name] = value
+        return values
+
+    def _mapped_action(self, mapping, input_name):
+        return mapping.get("inputs", {}).get(input_name, "none")
+
+    def _motion_action(self, mapping, active_inputs):
+        movement_actions = {
+            "selected_forward",
+            "selected_reverse",
+            "selected_up",
+            "selected_down",
+            "up",
+            "down",
+            "forward",
+            "back",
+            "left",
+            "right",
+            "stop",
+        }
+        for input_name in GAMEPAD_INPUTS:
+            if input_name in active_inputs:
+                action = self._mapped_action(mapping, input_name)
+                if action in movement_actions:
+                    return action
+        return "stop"
+
+    def _handle_selection_edges(self, mapping, active_inputs):
+        active = set(active_inputs)
+        new_inputs = active - self._previous_inputs
+        self._previous_inputs = active
+        for input_name in GAMEPAD_INPUTS:
+            if input_name not in new_inputs:
+                continue
+            action = self._mapped_action(mapping, input_name)
+            if action == "previous_winch":
+                self._cycle_target(-1)
+            elif action == "next_winch":
+                self._cycle_target(1)
+
+    def _run(self):
+        reader = None
+        controller_was_connected = False
+        try:
+            reader = GamepadReader()
+            controller_was_connected = True
+            with self._lock:
+                self.active = True
+                self.controller_name = reader.name
+                self.last_probe = [{
+                    "index": 0,
+                    "name": reader.name,
+                    "axes": len(reader.snapshot().axes),
+                    "buttons": len(reader.snapshot().buttons),
+                    "hats": len(reader.snapshot().hats),
+                }]
+            while not self._stop.is_set():
+                mapping = load_gamepad_mapping()
+                snapshot = reader.snapshot()
+                status = self.mc.get_status()
+                mode = status.get("mode")
+                if mode == "SETUP" and mapping.get("enabled", True):
+                    self._handle_selection_edges(mapping, snapshot.active_inputs)
+                else:
+                    self._previous_inputs = set(snapshot.active_inputs)
+                action = self._motion_action(mapping, snapshot.active_inputs)
+                input_values = self._input_values(snapshot)
+                with self._lock:
+                    self.last_inputs = snapshot.active_inputs
+                    self.last_action = action
+                    self.last_update = time.time()
+                    self.axes = snapshot.axes
+                    self.buttons = snapshot.buttons
+                    self.hats = snapshot.hats
+                    self.input_values = input_values
+
+                if not mapping.get("enabled", True):
+                    block_reason = "disabled"
+                    if block_reason != self._last_block_reason:
+                        log.info(f"GAMEPAD blocked reason={block_reason}")
+                        self._last_block_reason = block_reason
+                    if self._last_command_key != ("disabled", "stop"):
+                        try:
+                            self.mc.manual_action("stop")
+                        except Exception:
+                            pass
+                        self._last_command_key = ("disabled", "stop")
+                    time.sleep(0.02)
+                    continue
+
+                if mode not in {"SETUP", "TEST"}:
+                    block_reason = f"mode:{mode}"
+                    if block_reason != self._last_block_reason:
+                        log.info(f"GAMEPAD blocked reason={block_reason}")
+                        self._last_block_reason = block_reason
+                    self._last_command_key = None
+                    time.sleep(0.02)
+                    continue
+
+                try:
+                    rpm = int(mapping.get("rpm", 250))
+                    command_key = (mode, self.selected_target, action, rpm)
+                    now = time.monotonic()
+                    movement_action = action in {"selected_forward", "selected_up", "selected_reverse", "selected_down"}
+                    is_new_command = command_key != self._last_command_key
+                    refresh_command = movement_action and (now - self._last_command_ts) >= GAMEPAD_COMMAND_REFRESH_SEC
+                    force_command = is_new_command or refresh_command
+                    if mode == "SETUP" and action in {"selected_forward", "selected_up"}:
+                        if force_command:
+                            wait_response = is_new_command
+                            force_write = is_new_command
+                            log.info(
+                                f"GAMEPAD command mode={mode} target={self.selected_target} "
+                                f"input={snapshot.active_inputs} action={action} dir=forward rpm={rpm} "
+                                f"force={force_write} wait_response={wait_response}"
+                            )
+                            self.mc.manual_winch_action(
+                                self.selected_target,
+                                "forward",
+                                rpm=rpm,
+                                allow_hall_below=True,
+                                force=force_write,
+                                wait_response=wait_response,
+                            )
+                            self._last_command_key = command_key
+                            self._last_command_ts = now
+                    elif mode == "SETUP" and action in {"selected_reverse", "selected_down"}:
+                        if force_command:
+                            wait_response = is_new_command
+                            force_write = is_new_command
+                            log.info(
+                                f"GAMEPAD command mode={mode} target={self.selected_target} "
+                                f"input={snapshot.active_inputs} action={action} dir=reverse rpm={rpm} "
+                                f"force={force_write} wait_response={wait_response}"
+                            )
+                            self.mc.manual_winch_action(
+                                self.selected_target,
+                                "reverse",
+                                rpm=rpm,
+                                allow_hall_below=True,
+                                force=force_write,
+                                wait_response=wait_response,
+                            )
+                            self._last_command_key = command_key
+                            self._last_command_ts = now
+                    elif mode == "TEST" and action not in {"selected_forward", "selected_reverse", "selected_up", "selected_down"}:
+                        if force_command:
+                            log.info(
+                                f"GAMEPAD command mode={mode} target={self.selected_target} "
+                                f"input={snapshot.active_inputs} action={action} rpm={rpm}"
+                            )
+                            self.mc.manual_action(action, rpm=rpm)
+                            self._last_command_key = command_key
+                            self._last_command_ts = now
+                    else:
+                        stop_key = (mode, "stop")
+                        should_stop = (
+                            self._last_command_key != stop_key
+                            or (now - self._last_stop_ts) >= GAMEPAD_STOP_REASSERT_SEC
+                        )
+                        if should_stop:
+                            if self._last_command_key != stop_key:
+                                log.info(
+                                    f"GAMEPAD stop mode={mode} target={self.selected_target} "
+                                    f"input={snapshot.active_inputs} action={action}"
+                                )
+                            self.mc.manual_action("stop")
+                            self._last_command_key = stop_key
+                            self._last_command_ts = now
+                            self._last_stop_ts = now
+                    with self._lock:
+                        self.last_error = None
+                    self._last_block_reason = None
+                except Exception as exc:
+                    log.error(
+                        f"GAMEPAD dispatch error mode={mode} target={self.selected_target} "
+                        f"input={snapshot.active_inputs} action={action} error={exc}"
+                    )
+                    try:
+                        self.mc.manual_action("stop")
+                    except Exception:
+                        pass
+                    self._last_command_key = None
+                    self._last_command_ts = 0.0
+                    with self._lock:
+                        self.last_error = str(exc)
+                time.sleep(0.02)
+        except Exception as exc:
+            try:
+                probe = GamepadReader.devices()
+            except Exception:
+                probe = []
+            if controller_was_connected and not self._stop.is_set():
+                reason = f"controller connection lost: {exc}"
+                log.error(reason)
+                try:
+                    self.mc.emergency_stop(reason)
+                except Exception:
+                    try:
+                        self.mc.stop_all(reason, as_fault=True)
+                    except Exception:
+                        pass
+            with self._lock:
+                self.last_error = str(exc)
+                self.last_probe = probe
+        finally:
+            if reader is not None:
+                reader.close()
+            try:
+                self.mc.manual_action("stop")
+            except Exception:
+                pass
+            with self._lock:
+                self.active = False
+
+
+gamepad_control = GamepadControl(mc)
 
 
 # ---------- routes ----------
@@ -122,6 +557,61 @@ def evb_live():
     return jsonify(payload)
 
 
+@app.get("/controller/status")
+def controller_status():
+    gamepad_control.ensure_started()
+    mapping = load_gamepad_mapping()
+    return jsonify({
+        "ok": True,
+        "mapping": mapping,
+        "controller": gamepad_control.status(),
+        "inputs": GAMEPAD_INPUTS,
+        "actions": GAMEPAD_ACTIONS,
+        "targets": [str(winch_id) for winch_id in WINCH_IDS] + ["all"],
+    })
+
+
+@app.post("/controller/mapping")
+def controller_mapping():
+    payload = request.get_json(force=True, silent=True) or {}
+    mapping = load_gamepad_mapping()
+    mapping["enabled"] = bool(payload.get("enabled", mapping["enabled"]))
+    mapping["rpm"] = max(0, min(4000, int(payload.get("rpm", mapping["rpm"]))))
+    inputs = payload.get("inputs", {})
+    if isinstance(inputs, dict):
+        for input_name, action in inputs.items():
+            if input_name in GAMEPAD_INPUTS and action in GAMEPAD_ACTIONS:
+                mapping["inputs"][input_name] = action
+    save_gamepad_mapping(mapping)
+    return ok({"mapping": mapping})
+
+
+@app.post("/controller/start")
+def controller_start():
+    if mc.get_status().get("mode") not in {"SETUP", "TEST"}:
+        return err("controller only starts in SETUP or TEST mode")
+    gamepad_control.start()
+    return ok({"controller": gamepad_control.status()})
+
+
+@app.post("/controller/target")
+def controller_target():
+    payload = request.get_json(force=True, silent=True) or {}
+    try:
+        if mc.get_status().get("mode") != "SETUP":
+            return err("controller target can only change in SETUP mode")
+        gamepad_control.set_target(payload.get("target", "1"))
+        return ok({"controller": gamepad_control.status()})
+    except Exception as exc:
+        return err(str(exc))
+
+
+@app.post("/controller/stop")
+def controller_stop():
+    gamepad_control.stop(disable_monitor=True)
+    return ok({"controller": gamepad_control.status()})
+
+
 @app.get("/")
 def index():
     return (
@@ -134,7 +624,19 @@ def index():
   <title>Supervisor Control</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
-    body { padding: 1.5rem; }
+    body {
+      padding: 1.5rem;
+      min-height: 100vh;
+      transition: background-color 180ms ease, box-shadow 180ms ease;
+    }
+    body.mode-idle { background: #f5f6f8; box-shadow: inset 0 0 0 9999px rgba(108,117,125,0.03); }
+    body.mode-setup { background: #eaf2ff; box-shadow: inset 0 0 0 9999px rgba(13,110,253,0.08); }
+    body.mode-test { background: #eaf7ef; box-shadow: inset 0 0 0 9999px rgba(25,135,84,0.08); }
+    body.mode-fault { background: #fdecef; box-shadow: inset 0 0 0 9999px rgba(220,53,69,0.10); }
+    body.mode-idle #mode-banner { background: #6c757d; }
+    body.mode-setup #mode-banner { background: #0d6efd; }
+    body.mode-test #mode-banner { background: #198754; }
+    body.mode-fault #mode-banner { background: #dc3545; }
     .card + .card { margin-top: 1rem; }
     .btn-group .btn { min-width: 90px; }
     pre { background: #111; color: #0f0; padding: 0.75rem; border-radius: 6px; }
@@ -149,11 +651,13 @@ def index():
       box-shadow: 0 0 0 0.2rem rgba(0,0,0,0.25);
     }
     label.disabled { opacity: 0.5; }
+    .controller-live-active { background-color: rgba(25,135,84,0.12); }
   </style>
 </head>
 <body>
   <div class="container-fluid">
     <h3 class="mb-3">Supervisor Control</h3>
+    <div id="mode-banner" class="text-white rounded shadow-sm px-3 py-2 mb-3">Mode: loading</div>
     <div class="row g-3">
       <div class="col-lg-4">
         <div class="card shadow-sm">
@@ -177,6 +681,42 @@ def index():
           <div class="card-body d-grid gap-2">
             <button class="btn btn-danger" onclick="post('/stop/all', {reason:'manual emergency'})">EMERGENCY STOP</button>
             <button class="btn btn-outline-danger" onclick="post('/stop', {reason:'manual stop'})">Soft Stop (no fault)</button>
+          </div>
+        </div>
+        <div class="card shadow-sm">
+          <div class="card-header">Wireless Controller (SETUP per-winch / TEST directional)</div>
+          <div class="card-body">
+            <div id="controller-status" class="mb-2 small text-muted">Loading…</div>
+            <div class="row g-2 mb-2">
+              <div class="col-6">
+                <label class="form-label">RPM</label>
+                <input id="controller-rpm" type="number" class="form-control" value="250">
+              </div>
+              <div class="col-6 d-flex align-items-end">
+                <div class="form-check">
+                  <input id="controller-enabled" class="form-check-input" type="checkbox" checked onchange="toggleControllerEnabled()">
+                  <label class="form-check-label" for="controller-enabled">Enable</label>
+                </div>
+              </div>
+            </div>
+            <div class="mb-2">
+              <label class="form-label">Controller Target</label>
+              <select id="controller-target" class="form-select" onchange="setControllerTarget(this.value)">
+                <option value="1">Winch 1</option>
+                <option value="2">Winch 2</option>
+                <option value="3">Winch 3</option>
+                <option value="4">Winch 4</option>
+                <option value="all">All Winches</option>
+              </select>
+              <div class="form-text">SETUP only: Button 7 cycles W1→W2→W3→W4→All, Button 6 cycles back. Hold Y/A to move selected target until release.</div>
+            </div>
+            <div id="controller-mapping"></div>
+            <div id="controller-raw" class="small text-muted mt-2"></div>
+            <div class="d-grid gap-2 mt-2">
+              <button class="btn btn-outline-primary" onclick="saveControllerMapping()">Save Mapping</button>
+              <button class="btn btn-outline-success" onclick="post('/controller/start')">Start Controller</button>
+              <button class="btn btn-outline-danger" onclick="post('/controller/stop')">Stop Controller</button>
+            </div>
           </div>
         </div>
       </div>
@@ -297,6 +837,11 @@ async function refreshEvb(){
   const js = await res.json().catch(()=>({ok:false,error:'bad json'}));
   renderEvb(js);
 }
+async function refreshController(){
+  const res = await fetch('/controller/status');
+  const js = await res.json().catch(()=>({ok:false,error:'bad json'}));
+  renderController(js);
+}
 function getVal(id){ return parseFloat(document.getElementById(id).value) || 0; }
 function dir(name){ post(`/test/dir/${name}`, {rpm:getVal('dir-rpm'), seconds:getVal('dir-sec')}); }
 function getSetupDir(){ return document.getElementById('setup-dir-rev').checked ? 'reverse' : 'forward'; }
@@ -309,6 +854,7 @@ function renderStatus(js){
     document.getElementById('status-text').textContent = `Status error: ${js.error || 'unknown'}`;
     return;
   }
+  setPageMode(js.mode, js.fault);
   document.getElementById('status-text').textContent = `Mode: ${js.mode} | Fault: ${js.fault || 'none'} | Last update: ${fmtTime(js.last_update)}`;
 
   document.getElementById('mode-idle').checked = (js.mode === 'IDLE');
@@ -348,6 +894,15 @@ function renderStatus(js){
   }
 }
 
+function setPageMode(mode, fault){
+  const body = document.body;
+  body.classList.remove('mode-idle', 'mode-setup', 'mode-test', 'mode-fault');
+  const nextMode = fault ? 'FAULT' : (mode || 'IDLE');
+  body.classList.add(`mode-${nextMode.toLowerCase()}`);
+  const banner = document.getElementById('mode-banner');
+  if (banner) banner.textContent = `Mode: ${nextMode}${fault ? ` | Fault: ${fault}` : ''}`;
+}
+
 function renderEvb(js){
   document.getElementById('evb-live-json').textContent = JSON.stringify(js, null, 2);
   if (js.ok === false) {
@@ -358,6 +913,96 @@ function renderEvb(js){
   const winchCount = Object.keys(js.winches || {}).length;
   document.getElementById('evb-live-text').textContent =
     `Host: ${js.host}:${js.port} | Ping: ${js.ping ? 'ok' : 'fail'} | Winches: ${winchCount} | Read errors: ${errorCount}`;
+}
+
+function renderController(js){
+  if (js.ok === false) {
+    document.getElementById('controller-status').textContent = `Controller error: ${js.error || 'unknown'}`;
+    return;
+  }
+  const mapping = js.mapping || {inputs:{}};
+  const controller = js.controller || {};
+  const inputValues = controller.input_values || {};
+  const enabledInput = document.getElementById('controller-enabled');
+  const rpmInput = document.getElementById('controller-rpm');
+  if (enabledInput && enabledInput.dataset.initialized !== '1') {
+    enabledInput.checked = !!mapping.enabled;
+    enabledInput.dataset.initialized = '1';
+  }
+  if (rpmInput && rpmInput.dataset.initialized !== '1') {
+    rpmInput.value = mapping.rpm ?? 250;
+    rpmInput.dataset.initialized = '1';
+  }
+  const targetSelect = document.getElementById('controller-target');
+  if (targetSelect && document.activeElement !== targetSelect) {
+    const targetOptions = (js.targets || ['1','2','3','4','all'])
+      .map(t => `<option value="${t}">${t === 'all' ? 'All Winches' : `Winch ${t}`}</option>`)
+      .join('');
+    if (targetSelect.innerHTML !== targetOptions) targetSelect.innerHTML = targetOptions;
+    targetSelect.value = controller.selected_target || '1';
+  }
+  document.getElementById('controller-status').textContent =
+    `Monitor: ${controller.active ? 'live' : 'off'} | Device: ${controller.controller_name || 'none'} | ` +
+    `Target: ${controller.selected_target || '1'} | Input: ${(controller.last_inputs || []).join(', ') || 'none'} | Action: ${controller.last_action || 'stop'} | ` +
+    `Error: ${controller.last_error || 'none'} | Detected: ${formatControllerProbe(controller.last_probe)}`;
+
+  const editing = document.activeElement && document.activeElement.classList.contains('controller-map');
+  if (!editing && document.querySelectorAll('.controller-map').length === 0) {
+    const actionOptions = (js.actions || []).map(a => `<option value="${a}">${a}</option>`).join('');
+    const inputs = js.inputs || [];
+    let html = '<div class="table-responsive"><table class="table table-sm table-bordered mb-0"><thead><tr><th>Input</th><th>Live</th><th>Action</th></tr></thead><tbody>';
+    for (const input of inputs) {
+      html += `<tr data-controller-row="${input}"><td>${input}</td><td><span class="badge text-bg-secondary controller-live" data-input="${input}">0</span></td><td><select class="form-select form-select-sm controller-map" data-input="${input}">${actionOptions}</select></td></tr>`;
+    }
+    html += '</tbody></table></div>';
+    document.getElementById('controller-mapping').innerHTML = html;
+    for (const select of document.querySelectorAll('.controller-map')) {
+      const input = select.dataset.input;
+      select.value = (mapping.inputs || {})[input] || 'none';
+    }
+  }
+  for (const badge of document.querySelectorAll('.controller-live')) {
+    const input = badge.dataset.input;
+    const value = inputValues[input] ?? 0;
+    const active = !!value;
+    badge.textContent = value;
+    badge.className = `badge controller-live ${active ? 'text-bg-success' : 'text-bg-secondary'}`;
+    const row = document.querySelector(`[data-controller-row="${input}"]`);
+    if (row) row.classList.toggle('controller-live-active', active);
+  }
+  const axes = (controller.axes || []).join(', ');
+  const buttons = (controller.buttons || []).join(', ');
+  const hats = (controller.hats || []).map(h => `[${h.join(',')}]`).join(' ');
+  document.getElementById('controller-raw').textContent =
+    `Axes: [${axes}] | Buttons: [${buttons}] | D-Pad: [${hats}]`;
+}
+
+function formatControllerProbe(probe){
+  if (!probe || probe.length === 0) return 'none';
+  return probe.map(p => `${p.index}:${p.name}`).join(', ');
+}
+
+async function saveControllerMapping(){
+  const inputs = {};
+  for (const select of document.querySelectorAll('.controller-map')) {
+    inputs[select.dataset.input] = select.value;
+  }
+  const payload = {
+    enabled: document.getElementById('controller-enabled').checked,
+    rpm: getVal('controller-rpm'),
+    inputs,
+  };
+  await post('/controller/mapping', payload);
+  refreshController();
+}
+
+async function toggleControllerEnabled(){
+  await saveControllerMapping();
+}
+
+async function setControllerTarget(target){
+  await post('/controller/target', {target});
+  refreshController();
 }
 
 function connectSSE(){
@@ -375,6 +1020,8 @@ function connectSSE(){
 function fmtTime(t){ if(!t) return 'n/a'; const d=new Date(t*1000); return d.toLocaleTimeString(); }
 connectSSE();
 refreshEvb();
+refreshController();
+setInterval(refreshController, 100);
 </script>
 
 </body>
@@ -387,6 +1034,7 @@ refreshEvb();
 def mode_idle():
     try:
         log.info("UI: mode idle")
+        gamepad_control.stop()
         mc.set_mode("IDLE")
         return ok()
     except Exception as exc:
@@ -398,6 +1046,8 @@ def mode_setup():
     try:
         log.info("UI: mode setup")
         mc.set_mode("SETUP")
+        if load_gamepad_mapping().get("enabled", True):
+            gamepad_control.start()
         return ok()
     except Exception as exc:
         return err(str(exc))
@@ -408,6 +1058,8 @@ def mode_test():
     try:
         log.info("UI: mode test")
         mc.set_mode("TEST")
+        if load_gamepad_mapping().get("enabled", True):
+            gamepad_control.start()
         return ok()
     except Exception as exc:
         return err(str(exc))
@@ -417,6 +1069,7 @@ def mode_test():
 def clear_fault():
     try:
         log.info("UI: clear fault")
+        gamepad_control.stop()
         mc.clear_fault()
         return ok()
     except Exception as exc:
@@ -427,6 +1080,7 @@ def clear_fault():
 def stop():
     reason = request.json.get("reason", "user stop") if request.is_json else "user stop"
     log.warning(f"UI: stop ({reason})")
+    gamepad_control.stop()
     mc.stop_all(reason)
     return ok({"stopped": True, "reason": reason})
 
@@ -435,6 +1089,7 @@ def stop():
 def stop_all_fault():
     reason = request.json.get("reason", "emergency stop") if request.is_json else "emergency stop"
     log.warning(f"UI: emergency stop ({reason})")
+    gamepad_control.stop()
     mc.emergency_stop(reason)
     return ok({"stopped": True, "fault": True, "reason": reason})
 

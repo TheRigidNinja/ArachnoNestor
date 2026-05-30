@@ -23,6 +23,8 @@ DEFAULTS: Dict[str, Any] = {
         "winch_ids": [1, 2, 3, 4],
         "serial_port": "/dev/ttyUSB0",
         "baud_rate": 9600,
+        "serial_timeout": 0.25,
+        "nonblocking_command_gap": 0.02,
         "device_address": 1,
     },
     "web": {"host": "0.0.0.0", "port": 8080},
