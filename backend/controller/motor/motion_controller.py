@@ -178,7 +178,7 @@ class MotionController:
 
     def emergency_stop(self, reason: str = "emergency stop") -> None:
         """Force-stop and enter FAULT regardless of current state."""
-        self.stop_all(reason=reason, as_fault=True, wait_response=False, brake=True)
+        self.stop_all(reason=reason, as_fault=True, wait_response=True, brake=True)
 
     def setup_jog(self, rpm: int = 200, seconds: float = 1.0) -> str:
         with self._lock:
@@ -526,12 +526,14 @@ class MotionController:
                 if wait_response and not rpm_response:
                     command_failed = True
                     log.warning(f"MOTOR no-ack rpm motor={motor_id} rpm={abs_rpm}")
+                    log.error(f"RPM FAILED: no ACK from motor {motor_id}")
             if force or (not state["running"]) or state["dir"] != desired_dir:
                 log.info(f"MOTOR cmd start motor={motor_id} dir={desired_dir} wait_response={wait_response}")
                 start_response = self.motor.start(desired_dir, motor_id, wait_response=wait_response)
                 if wait_response and not start_response:
                     command_failed = True
                     log.warning(f"MOTOR no-ack start motor={motor_id} dir={desired_dir}")
+                    log.error(f"START FAILED: no ACK from motor {motor_id}")
             if command_failed:
                 state["running"] = False
                 state["rpm"] = 0

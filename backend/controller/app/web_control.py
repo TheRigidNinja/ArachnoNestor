@@ -226,6 +226,16 @@ class GamepadControl:
         self._last_command_ts = 0.0
         self._last_stop_ts = 0.0
 
+    def disable_without_motor_command(self):
+        with self._lock:
+            self._monitor_disabled = True
+            self.active = False
+            self.last_action = "stop"
+            self._last_command_key = None
+            self._last_command_ts = 0.0
+            self._last_stop_ts = 0.0
+        self._stop.set()
+
     def _stop_motors_now(self):
         try:
             mode = self.mc.get_status().get("mode")
@@ -512,10 +522,13 @@ class GamepadControl:
         finally:
             if reader is not None:
                 reader.close()
-            try:
-                self.mc.manual_action("stop")
-            except Exception:
-                pass
+            with self._lock:
+                send_final_stop = not self._monitor_disabled
+            if send_final_stop:
+                try:
+                    self.mc.manual_action("stop")
+                except Exception:
+                    pass
             with self._lock:
                 self.active = False
 
@@ -1150,7 +1163,7 @@ def stop():
 def stop_all_fault():
     reason = request.json.get("reason", "emergency stop") if request.is_json else "emergency stop"
     log.warning(f"UI: emergency stop ({reason})")
-    gamepad_control.stop()
+    gamepad_control.disable_without_motor_command()
     mc.emergency_stop(reason)
     return ok({"stopped": True, "fault": True, "reason": reason})
 

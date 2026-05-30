@@ -131,13 +131,16 @@ class TestSetupHall(unittest.TestCase):
         self.assertFalse(mc.motor.last_wait_response)
         self.assertFalse(mc.motor.last_brake)
 
-    def test_emergency_stop_uses_brake_without_waiting(self):
+    def test_emergency_stop_uses_brake_with_ack_debug(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.emergency_stop("test emergency")
-        self.assertEqual(mc.motor.stops, [1, 2, 3, 4])
-        self.assertFalse(mc.motor.last_wait_response)
-        self.assertTrue(mc.motor.last_brake)
+        self.assertEqual(mc.motor.stop_calls, [
+            (1, True, True),
+            (2, True, True),
+            (3, True, True),
+            (4, True, True),
+        ])
         self.assertEqual(mc.mode, "FAULT")
 
     def test_selected_winch_stop_brakes_target_only_with_ack_debug(self):
@@ -191,6 +194,33 @@ class TestSetupHall(unittest.TestCase):
         self.assertFalse(mc._motor_state[1]["running"])
         self.assertEqual(mc._motor_state[1]["rpm"], 0)
         self.assertIsNone(mc._motor_state[1]["dir"])
+
+    def test_manual_winch_action_still_starts_if_rpm_ack_fails(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+        mc.motor.write_rpm = lambda *args, **kwargs: None
+        output = io.StringIO()
+        with redirect_stdout(output):
+            mc.manual_winch_action(1, "forward", rpm=200, allow_hall_below=True, force=True, wait_response=True)
+        self.assertEqual(mc.motor.starts, [(1, "F")])
+        self.assertIn("RPM FAILED: no ACK from motor 1", output.getvalue())
+
+    def test_manual_winch_action_logs_start_ack_failure(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+
+        def start_no_ack(direction: str, motor_id: int | None = None, wait_response: bool = True):
+            mc.motor.starts.append((motor_id, direction))
+            return None
+
+        mc.motor.start = start_no_ack
+        output = io.StringIO()
+        with redirect_stdout(output):
+            mc.manual_winch_action(1, "forward", rpm=200, allow_hall_below=True, force=True, wait_response=True)
+        self.assertEqual(mc.motor.starts, [(1, "F")])
+        self.assertIn("START FAILED: no ACK from motor 1", output.getvalue())
 
 if __name__ == "__main__":
     unittest.main()

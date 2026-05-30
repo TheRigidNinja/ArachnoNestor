@@ -26,7 +26,7 @@ DEFAULTS: Dict[str, Any] = {
         "serial_timeout": 0.25,
         "nonblocking_command_gap": 0.06,
         "manual_command_gap": 0.06,
-        "manual_first_command_wait_response": False,
+        "manual_first_command_wait_response": True,
         "log_modbus_frames": True,
         "device_address": 1,
     },
