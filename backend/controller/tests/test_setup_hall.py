@@ -12,14 +12,18 @@ class DummyMotor:
     def __init__(self):
         self.started = False
         self.stopped = False
+        self.events = []
         self.starts = []
         self.stops = []
         self.stop_calls = []
+        self.rpm_writes = []
 
     def write_rpm(self, rpm: int, motor_id: int | None = None, wait_response: bool = True) -> None:
         self.last_rpm = rpm
         self.last_motor_id = motor_id
         self.last_wait_response = wait_response
+        self.rpm_writes.append((motor_id, rpm, wait_response))
+        self.events.append(("rpm", motor_id, rpm, wait_response))
         return b"ok"
 
     def start(self, direction: str, motor_id: int | None = None, wait_response: bool = True) -> None:
@@ -28,6 +32,7 @@ class DummyMotor:
         self.last_motor_id = motor_id
         self.last_wait_response = wait_response
         self.starts.append((motor_id, direction))
+        self.events.append(("start", motor_id, direction, wait_response))
         return b"ok"
 
     def stop(self, motor_id: int | None = None, wait_response: bool = False, brake: bool = False) -> None:
@@ -37,12 +42,14 @@ class DummyMotor:
         self.last_brake = brake
         self.stops.append(motor_id)
         self.stop_calls.append((motor_id, wait_response, brake))
+        self.events.append(("stop", motor_id, wait_response, brake))
         return b"ok"
 
 
 class TestMotionController(MotionController):
     def __init__(self, halls, setup_active):
         self._lock = threading.Lock()
+        self._command_lock = threading.RLock()
         self.mode = "SETUP"
         self.fault = None
         self.last_halls = halls
@@ -118,8 +125,20 @@ class TestSetupHall(unittest.TestCase):
         halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.mode = "SETUP"
-        mc.manual_winch_action("all", "reverse", rpm=200, allow_hall_below=True)
+        mc.manual_winch_action("all", "reverse", rpm=200, allow_hall_below=True, wait_response=True)
         self.assertEqual(mc.motor.starts, [(1, "R"), (2, "R"), (3, "R"), (4, "R")])
+        self.assertEqual(mc.motor.events[:4], [
+            ("rpm", 1, 200, False),
+            ("rpm", 2, 200, False),
+            ("rpm", 3, 200, False),
+            ("rpm", 4, 200, False),
+        ])
+        self.assertEqual(mc.motor.events[4:], [
+            ("start", 1, "R", False),
+            ("start", 2, "R", False),
+            ("start", 3, "R", False),
+            ("start", 4, "R", False),
+        ])
         for winch_id in WINCH_IDS:
             self.assertTrue(mc._motor_state[winch_id]["running"])
 
@@ -131,15 +150,15 @@ class TestSetupHall(unittest.TestCase):
         self.assertFalse(mc.motor.last_wait_response)
         self.assertFalse(mc.motor.last_brake)
 
-    def test_emergency_stop_uses_brake_with_ack_debug(self):
+    def test_emergency_stop_uses_brake_without_waiting(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.emergency_stop("test emergency")
         self.assertEqual(mc.motor.stop_calls, [
-            (1, True, True),
-            (2, True, True),
-            (3, True, True),
-            (4, True, True),
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
         ])
         self.assertEqual(mc.mode, "FAULT")
 
@@ -154,10 +173,14 @@ class TestSetupHall(unittest.TestCase):
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.selected_winch_stop("all")
         self.assertEqual(mc.motor.stop_calls, [
-            (1, True, True),
-            (2, True, True),
-            (3, True, True),
-            (4, True, True),
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
         ])
 
     def test_selected_winch_stop_logs_no_ack(self):

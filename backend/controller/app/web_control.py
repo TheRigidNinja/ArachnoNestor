@@ -24,7 +24,7 @@ log = get_logger("app.web_control")
 GAMEPAD_MAPPING_PATH = Path(__file__).resolve().parents[1] / "config" / "gamepad_mapping.json"
 GAMEPAD_COMMAND_REFRESH_SEC = 0.35
 GAMEPAD_STOP_REASSERT_SEC = 0.20
-GAMEPAD_WATCHDOG_SEC = 0.75
+GAMEPAD_WATCHDOG_SEC = 2.0
 MANUAL_FIRST_COMMAND_WAIT_RESPONSE = bool(CONFIG["motion"].get("manual_first_command_wait_response", False))
 GAMEPAD_INPUTS = [
     "axis_0_neg",
@@ -150,6 +150,7 @@ class GamepadControl:
         self._last_command_ts = 0.0
         self._last_stop_ts = 0.0
         self._last_block_reason = None
+        self._command_in_progress = False
 
     def status(self):
         with self._lock:
@@ -166,6 +167,7 @@ class GamepadControl:
                 "input_values": dict(self.input_values),
                 "selected_target": self.selected_target,
                 "last_probe": list(self.last_probe),
+                "command_in_progress": self._command_in_progress,
             }
 
     def start(self):
@@ -234,13 +236,28 @@ class GamepadControl:
             self._last_command_key = None
             self._last_command_ts = 0.0
             self._last_stop_ts = 0.0
+            self._command_in_progress = False
         self._stop.set()
+
+    def _set_command_in_progress(self, value: bool):
+        with self._lock:
+            self._command_in_progress = value
+            self.last_update = time.time()
 
     def _stop_motors_now(self):
         try:
             mode = self.mc.get_status().get("mode")
             if mode == "SETUP":
-                self.mc.selected_winch_stop(self.selected_target)
+                all_stop = str(self.selected_target).lower() == "all"
+                self._set_command_in_progress(all_stop)
+                try:
+                    self.mc.selected_winch_stop(
+                        self.selected_target,
+                        wait_response=not all_stop,
+                        repeat_brake=all_stop,
+                    )
+                finally:
+                    self._set_command_in_progress(False)
             else:
                 self.mc.manual_action("stop")
         except Exception:
@@ -258,8 +275,9 @@ class GamepadControl:
                 active = self.active
                 last_update = self.last_update
                 last_action = self.last_action
+                command_in_progress = self._command_in_progress
             stale = last_update is not None and (time.time() - last_update) > GAMEPAD_WATCHDOG_SEC
-            if active and stale and last_action != "stop":
+            if active and stale and last_action != "stop" and not command_in_progress:
                 log.warning("GAMEPAD watchdog stop: controller input stale")
                 self._stop_motors_now()
             time.sleep(0.05)
@@ -394,44 +412,53 @@ class GamepadControl:
                     is_new_command = command_key != self._last_command_key
                     refresh_command = movement_action and (now - self._last_command_ts) >= GAMEPAD_COMMAND_REFRESH_SEC
                     force_command = is_new_command or refresh_command
+                    all_target = str(self.selected_target).lower() == "all"
                     if mode == "SETUP" and action in {"selected_forward", "selected_up"}:
                         if force_command:
-                            wait_response = MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
+                            wait_response = False if all_target else MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
                             force_write = is_new_command
                             log.info(
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
                                 f"input={snapshot.active_inputs} action={action} dir=forward rpm={rpm} "
                                 f"force={force_write} wait_response={wait_response}"
                             )
-                            self.mc.manual_winch_action(
-                                self.selected_target,
-                                "forward",
-                                rpm=rpm,
-                                allow_hall_below=True,
-                                force=force_write,
-                                wait_response=wait_response,
-                            )
+                            self._set_command_in_progress(all_target)
+                            try:
+                                self.mc.manual_winch_action(
+                                    self.selected_target,
+                                    "forward",
+                                    rpm=rpm,
+                                    allow_hall_below=True,
+                                    force=force_write,
+                                    wait_response=wait_response,
+                                )
+                            finally:
+                                self._set_command_in_progress(False)
                             self._last_command_key = command_key
-                            self._last_command_ts = now
+                            self._last_command_ts = time.monotonic()
                     elif mode == "SETUP" and action in {"selected_reverse", "selected_down"}:
                         if force_command:
-                            wait_response = MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
+                            wait_response = False if all_target else MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
                             force_write = is_new_command
                             log.info(
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
                                 f"input={snapshot.active_inputs} action={action} dir=reverse rpm={rpm} "
                                 f"force={force_write} wait_response={wait_response}"
                             )
-                            self.mc.manual_winch_action(
-                                self.selected_target,
-                                "reverse",
-                                rpm=rpm,
-                                allow_hall_below=True,
-                                force=force_write,
-                                wait_response=wait_response,
-                            )
+                            self._set_command_in_progress(all_target)
+                            try:
+                                self.mc.manual_winch_action(
+                                    self.selected_target,
+                                    "reverse",
+                                    rpm=rpm,
+                                    allow_hall_below=True,
+                                    force=force_write,
+                                    wait_response=wait_response,
+                                )
+                            finally:
+                                self._set_command_in_progress(False)
                             self._last_command_key = command_key
-                            self._last_command_ts = now
+                            self._last_command_ts = time.monotonic()
                     elif mode == "TEST" and action not in {"selected_forward", "selected_reverse", "selected_up", "selected_down"}:
                         if force_command:
                             log.info(
@@ -474,16 +501,22 @@ class GamepadControl:
                                     f"input={snapshot.active_inputs} action={action}"
                                 )
                             if mode == "SETUP":
-                                self.mc.selected_winch_stop(
-                                    stop_target,
-                                    natural_all_after_brake=False,
-                                    wait_response=True,
-                                )
+                                all_stop = str(stop_target).lower() == "all"
+                                self._set_command_in_progress(all_stop)
+                                try:
+                                    self.mc.selected_winch_stop(
+                                        stop_target,
+                                        natural_all_after_brake=False,
+                                        wait_response=not all_stop,
+                                        repeat_brake=all_stop,
+                                    )
+                                finally:
+                                    self._set_command_in_progress(False)
                             else:
                                 self.mc.manual_action("stop")
                             self._last_command_key = stop_key
-                            self._last_command_ts = now
-                            self._last_stop_ts = now
+                            self._last_command_ts = time.monotonic()
+                            self._last_stop_ts = self._last_command_ts
                     with self._lock:
                         self.last_error = None
                     self._last_block_reason = None
