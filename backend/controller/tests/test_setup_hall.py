@@ -142,6 +142,34 @@ class TestSetupHall(unittest.TestCase):
         for winch_id in WINCH_IDS:
             self.assertTrue(mc._motor_state[winch_id]["running"])
 
+    def test_setup_all_run_test_commands_each_motor_with_ack_then_brakes(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+        label = mc.setup_all_run_test(rpm=500, seconds=0, direction="forward")
+        self.assertEqual(label, "setup_all_run_test")
+        self.assertEqual(mc.motor.events, [
+            ("rpm", 1, 500, True),
+            ("start", 1, "F", True),
+            ("rpm", 2, 500, True),
+            ("start", 2, "F", True),
+            ("rpm", 3, 500, True),
+            ("start", 3, "F", True),
+            ("rpm", 4, 500, True),
+            ("start", 4, "F", True),
+            ("stop", 1, False, True),
+            ("stop", 2, False, True),
+            ("stop", 3, False, True),
+            ("stop", 4, False, True),
+        ])
+
+    def test_setup_all_run_test_blocked_outside_setup(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "TEST"
+        with self.assertRaises(RuntimeError):
+            mc.setup_all_run_test(rpm=500, seconds=0, direction="forward")
+
     def test_stop_all_forces_stop_even_if_state_is_wrong(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)

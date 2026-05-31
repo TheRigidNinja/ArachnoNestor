@@ -848,6 +848,7 @@ def index():
               <label class="btn btn-outline-dark" for="setup-dir-rev">Reverse</label>
             </div>
             <button class="btn btn-primary w-100" onclick="post('/setup/hall', {rpm:getVal('setup-rpm'), seconds:getVal('setup-sec'), direction:getSetupDir()})">Run Hall</button>
+            <button class="btn btn-outline-warning w-100 mt-2" onclick="post('/setup/all-run-test')">Run All Winches Test</button>
           </div>
         </div>
         <div class="card shadow-sm">
@@ -1225,6 +1226,20 @@ def setup_hall():
         label = mc.setup_hall_run(rpm=rpm, seconds=seconds, direction=direction)
 
         # log.info(f"Started setup hall job: {"label"}")
+        return ok({"job": label})
+    except Exception as exc:
+        return err(str(exc))
+
+
+@app.post("/setup/all-run-test")
+def setup_all_run_test():
+    payload = request.get_json(force=True, silent=True) or {}
+    rpm = int(payload.get("rpm", 500))
+    seconds = float(payload.get("seconds", 2.0))
+    direction = str(payload.get("direction", "forward"))
+    try:
+        log.info(f"UI: setup all-run-test rpm={rpm} sec={seconds} dir={direction}")
+        label = mc.setup_all_run_test(rpm=rpm, seconds=seconds, direction=direction)
         return ok({"job": label})
     except Exception as exc:
         return err(str(exc))

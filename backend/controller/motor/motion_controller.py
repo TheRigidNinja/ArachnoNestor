@@ -209,6 +209,44 @@ class MotionController:
             label=f"setup_hall_{direction}",
         )
 
+    def setup_all_run_test(self, rpm: int = 500, seconds: float = 2.0, direction: str = "forward") -> str:
+        direction = direction.lower()
+        if direction not in {"forward", "reverse"}:
+            raise ValueError("invalid direction")
+        seconds = max(0.0, float(seconds))
+        abs_rpm = max(0, int(rpm))
+        motor_dir = "F" if direction == "forward" else "R"
+
+        with self._command_lock:
+            with self._lock:
+                self._ensure_ready("SETUP")
+            if not self._motion_allowed_or_stopped(allow_hall_below=True):
+                raise RuntimeError("all-winch ACK test blocked by safety")
+
+            log.info(f"ALL ACK TEST BEGIN dir={direction} rpm={abs_rpm} sec={seconds}")
+            try:
+                for motor_id in WINCH_IDS:
+                    log.info(f"ALL ACK TEST rpm motor={motor_id} rpm={abs_rpm} wait_response=True")
+                    rpm_response = self.motor.write_rpm(abs_rpm, motor_id, wait_response=True)
+                    if not rpm_response:
+                        log.error(f"RPM FAILED: no ACK from motor {motor_id}")
+
+                    log.info(f"ALL ACK TEST start motor={motor_id} dir={motor_dir} wait_response=True")
+                    start_response = self.motor.start(motor_dir, motor_id, wait_response=True)
+                    if not start_response:
+                        log.error(f"START FAILED: no ACK from motor {motor_id}")
+
+                    state = self._motor_state[motor_id]
+                    state["running"] = bool(start_response)
+                    state["rpm"] = abs_rpm if start_response else 0
+                    state["dir"] = motor_dir if start_response else None
+
+                time.sleep(seconds)
+            finally:
+                self._brake_stop_targets(list(WINCH_IDS), wait_response=False)
+                log.info("ALL ACK TEST END")
+        return "setup_all_run_test"
+
     def test_up(self, rpm: int = 350, seconds: float = 10.0) -> str:
         with self._lock:
             self._ensure_ready("TEST")
