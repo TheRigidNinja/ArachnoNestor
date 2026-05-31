@@ -212,6 +212,23 @@ class TestSetupHall(unittest.TestCase):
         self.assertFalse(mc.motor.last_wait_response)
         self.assertFalse(mc.motor.last_brake)
 
+    def test_stop_all_as_fault_uses_repeated_brake(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.stop_all("fault stop", as_fault=True)
+        self.assertEqual(mc.motor.stop_calls, [
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+        ])
+        self.assertEqual(mc.mode, "FAULT")
+        self.assertEqual(mc.fault, "fault stop")
+
     def test_emergency_stop_uses_brake_without_waiting(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
@@ -244,6 +261,13 @@ class TestSetupHall(unittest.TestCase):
         ])
         self.assertEqual(mc.mode, "FAULT")
         self.assertEqual(mc.fault, "test fault")
+
+    def test_safe_brake_all_replaces_existing_fault_reason(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.fault = "old fault"
+        mc.safe_brake_all("new fault")
+        self.assertEqual(mc.fault, "new fault")
 
     def test_selected_winch_stop_brakes_target_only_with_ack_debug(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}

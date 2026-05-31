@@ -172,15 +172,13 @@ class MotionController:
         brake: bool = False,
     ) -> None:
         """Stop motors. If as_fault=True, enter FAULT mode and record reason."""
+        if as_fault:
+            self.safe_brake_all(reason)
+            return
         with self._command_lock:
-            if as_fault and not brake:
-                brake = True
             with self._lock:
                 self._stop_motors_locked(reason, force=True, wait_response=wait_response, brake=brake)
                 self._allow_hall_below = False
-                if as_fault:
-                    self.fault = reason if self.fault is None else self.fault
-                    self.mode = "FAULT"
 
     def safe_brake_all(self, reason: str) -> None:
         """Repeated braking stop that is safe to call from fault paths."""
@@ -193,7 +191,7 @@ class MotionController:
         self._brake_stop_targets(list(WINCH_IDS), wait_response=False)
         with self._lock:
             self._allow_hall_below = False
-            self.fault = reason if self.fault is None else self.fault
+            self.fault = reason
             self.mode = "FAULT"
 
     def emergency_stop(self, reason: str = "emergency stop") -> None:
