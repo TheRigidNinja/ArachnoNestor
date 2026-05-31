@@ -96,6 +96,40 @@ class TestSetupHall(unittest.TestCase):
         mc._command_motors(DIRECTION_MAP["up"], rpm=200)
         self.assertIsNone(mc.fault)
 
+    def test_stale_sensor_fault_brakes_all(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.last_update = time.time() - STALE_TIMEOUT - 1.0
+        mc._command_motors(DIRECTION_MAP["up"], rpm=200)
+        self.assertEqual(mc.motor.stop_calls, [
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+        ])
+        self.assertEqual(mc.mode, "FAULT")
+
+    def test_hall_job_safety_fault_brakes_without_natural_stop(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=True)
+        mc.last_update = time.time() - STALE_TIMEOUT - 1.0
+        mc._run_hall_job(DIRECTION_MAP["up"], rpm=200, max_seconds=0.0, label="test")
+        self.assertEqual(mc.motor.stop_calls, [
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+        ])
+        self.assertEqual(mc.mode, "FAULT")
+
     def test_idle_mode_does_not_command_motors(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
@@ -187,8 +221,29 @@ class TestSetupHall(unittest.TestCase):
             (2, False, True),
             (3, False, True),
             (4, False, True),
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
         ])
         self.assertEqual(mc.mode, "FAULT")
+
+    def test_safe_brake_all_repeats_brake_and_faults(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.safe_brake_all("test fault")
+        self.assertEqual(mc.motor.stop_calls, [
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+            (1, False, True),
+            (2, False, True),
+            (3, False, True),
+            (4, False, True),
+        ])
+        self.assertEqual(mc.mode, "FAULT")
+        self.assertEqual(mc.fault, "test fault")
 
     def test_selected_winch_stop_brakes_target_only_with_ack_debug(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}

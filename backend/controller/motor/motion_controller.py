@@ -173,6 +173,8 @@ class MotionController:
     ) -> None:
         """Stop motors. If as_fault=True, enter FAULT mode and record reason."""
         with self._command_lock:
+            if as_fault and not brake:
+                brake = True
             with self._lock:
                 self._stop_motors_locked(reason, force=True, wait_response=wait_response, brake=brake)
                 self._allow_hall_below = False
@@ -180,10 +182,23 @@ class MotionController:
                     self.fault = reason if self.fault is None else self.fault
                     self.mode = "FAULT"
 
+    def safe_brake_all(self, reason: str) -> None:
+        """Repeated braking stop that is safe to call from fault paths."""
+        with self._command_lock:
+            self._safe_brake_all_under_command_lock(reason)
+
+    def _safe_brake_all_under_command_lock(self, reason: str) -> None:
+        self._brake_stop_targets(list(WINCH_IDS), wait_response=False)
+        time.sleep(0.1)
+        self._brake_stop_targets(list(WINCH_IDS), wait_response=False)
+        with self._lock:
+            self._allow_hall_below = False
+            self.fault = reason if self.fault is None else self.fault
+            self.mode = "FAULT"
+
     def emergency_stop(self, reason: str = "emergency stop") -> None:
         """Force-stop and enter FAULT regardless of current state."""
-        with self._command_lock:
-            self.stop_all(reason=reason, as_fault=True, wait_response=False, brake=True)
+        self.safe_brake_all(reason)
 
     def setup_jog(self, rpm: int = 200, seconds: float = 1.0) -> str:
         with self._lock:
@@ -506,10 +521,13 @@ class MotionController:
             self._command_motors(targets, rpm)
             time.sleep(max(0.0, seconds))
         except Exception as exc:  # safety: any failure → fault
-            self.stop_all(f"job error {label}: {exc}", as_fault=True)
+            self.safe_brake_all(f"job error {label}: {exc}")
             return
         finally:
-            self._stop_motors("job finished")
+            with self._lock:
+                faulted = self.mode == "FAULT" or self.fault is not None
+            if not faulted:
+                self._stop_motors("job finished")
             with self._lock:
                 self._job_thread = None
                 self._allow_hall_below = False
@@ -521,6 +539,7 @@ class MotionController:
         try:
             while True:
                 wait_for_hall = False
+                fault_reason = None
                 with self._lock:
                     status = self._safety.evaluate(self.last_halls, self.last_update)
                     if not status.can_move:
@@ -529,11 +548,12 @@ class MotionController:
                             self._stop_motors_locked("hall below threshold")
                             wait_for_hall = True
                         else:
-                            self.fault = status.reason
-                            self.mode = "FAULT"
-                            log.warning(f"Motion blocked: {status.reason}")
-                            self._stop_motors_locked("safety stop")
-                            return
+                            fault_reason = status.reason or "safety stop"
+
+                if fault_reason:
+                    log.warning(f"Motion blocked: {fault_reason}")
+                    self.safe_brake_all(fault_reason)
+                    return
 
                 if wait_for_hall:
                     time.sleep(POLL_INTERVAL)
@@ -544,10 +564,13 @@ class MotionController:
                     break
                 time.sleep(POLL_INTERVAL)
         except Exception as exc:  # safety: any failure → fault
-            self.stop_all(f"job error {label}: {exc}", as_fault=True)
+            self.safe_brake_all(f"job error {label}: {exc}")
             return
         finally:
-            self._stop_motors("hall job finished")
+            with self._lock:
+                faulted = self.mode == "FAULT" or self.fault is not None
+            if not faulted:
+                self._stop_motors("hall job finished")
             with self._lock:
                 self._job_thread = None
                 self._setup_hall_active = False
@@ -637,6 +660,7 @@ class MotionController:
             log.info("ALL MOVE END")
 
     def _motion_allowed_or_stopped(self, allow_hall_below: bool) -> bool:
+        fault_reason = None
         with self._lock:
             if self.mode not in {"SETUP", "TEST"}:
                 self._stop_motors_locked("mode not armed")
@@ -654,11 +678,10 @@ class MotionController:
                 log.warning(f"Motion blocked: {status.reason}")
                 self._stop_motors_locked("hall below threshold")
                 return False
-            self.fault = status.reason
-            self.mode = "FAULT"
-            log.warning(f"Motion blocked: {status.reason}")
-            self._stop_motors_locked("safety stop")
-            return False
+            fault_reason = status.reason or "safety stop"
+        log.warning(f"Motion blocked: {fault_reason}")
+        self._safe_brake_all_under_command_lock(fault_reason)
+        return False
 
     def _stop_motor(
         self,
@@ -755,11 +778,12 @@ class MotionController:
                                 f"EVB read error: {exc}; backoff={backoff:.2f}s "
                                 f"(count={self._evb_error_count} streak={self._evb_error_streak})"
                             )
-                            self.stop_all(f"EVB error: {exc}", as_fault=True)
+                            self.safe_brake_all(f"EVB error: {exc}")
                             had_error = True
                             break
 
                         now = time.time()
+                        fault_reason = None
                         with self._lock:
                             self.last_halls.update(halls)
                             self.last_power.update(power)
@@ -785,13 +809,13 @@ class MotionController:
                                     else:
                                         self._stop_motors_locked("hall below threshold")
                                 else:
-                                    self.fault = status.reason
-                                    self.mode = "FAULT"
-                                    self._stop_motors_locked("safety stop")
+                                    fault_reason = status.reason or "safety stop"
                             log.debug(
                                 f"EVB sample halls={self.last_halls} power={self.last_power} "
                                 f"imu={'ok' if self.last_imu else 'none'}"
                             )
+                        if fault_reason:
+                            self.safe_brake_all(fault_reason)
 
                         elapsed = time.time() - cycle_start
                         sleep_for = max(0.0, POLL_INTERVAL - elapsed)
@@ -815,7 +839,7 @@ class MotionController:
                     f"EVB connection failure: {exc}; backoff={backoff:.2f}s "
                     f"(count={self._evb_error_count} streak={self._evb_error_streak})"
                 )
-                self.stop_all(f"EVB connection failure: {exc}", as_fault=True)
+                self.safe_brake_all(f"EVB connection failure: {exc}")
                 time.sleep(backoff)
                 backoff = min(EVB_BACKOFF_MAX, backoff * EVB_BACKOFF_FACTOR)
 

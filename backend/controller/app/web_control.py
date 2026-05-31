@@ -247,12 +247,15 @@ class GamepadControl:
     def _stop_motors_now(self):
         try:
             mode = self.mc.get_status().get("mode")
-            if mode == "SETUP":
-                all_stop = str(self.selected_target).lower() == "all"
+            previous_command_key = self._last_command_key
+            previous_was_setup_move = self._is_setup_movement_key(previous_command_key)
+            if mode == "SETUP" or (mode == "FAULT" and previous_was_setup_move):
+                stop_target = previous_command_key[1] if previous_was_setup_move else self.selected_target
+                all_stop = str(stop_target).lower() == "all"
                 self._set_command_in_progress(all_stop)
                 try:
                     self.mc.selected_winch_stop(
-                        self.selected_target,
+                        stop_target,
                         wait_response=not all_stop,
                         repeat_brake=all_stop,
                     )
@@ -332,6 +335,40 @@ class GamepadControl:
                     return action
         return "stop"
 
+    def _is_setup_movement_key(self, command_key):
+        return (
+            isinstance(command_key, tuple)
+            and len(command_key) == 4
+            and command_key[0] == "SETUP"
+            and command_key[2] in {
+                "selected_forward",
+                "selected_up",
+                "selected_reverse",
+                "selected_down",
+            }
+        )
+
+    def _dispatch_setup_stop(self, mode, stop_target, active_inputs, action):
+        log.info(
+            f"GAMEPAD stop mode={mode} target={stop_target} "
+            f"input={active_inputs} action={action}"
+        )
+        all_stop = str(stop_target).lower() == "all"
+        self._set_command_in_progress(all_stop)
+        try:
+            self.mc.selected_winch_stop(
+                stop_target,
+                natural_all_after_brake=False,
+                wait_response=not all_stop,
+                repeat_brake=all_stop,
+            )
+        finally:
+            self._set_command_in_progress(False)
+        now = time.monotonic()
+        self._last_command_key = (mode, "stop")
+        self._last_command_ts = now
+        self._last_stop_ts = now
+
     def _handle_selection_edges(self, mapping, active_inputs):
         active = set(active_inputs)
         new_inputs = active - self._previous_inputs
@@ -395,12 +432,20 @@ class GamepadControl:
                     time.sleep(0.02)
                     continue
 
+                previous_command_key = self._last_command_key
+                previous_was_setup_move = self._is_setup_movement_key(previous_command_key)
+                if mode == "FAULT" and previous_was_setup_move and action == "stop":
+                    self._dispatch_setup_stop(mode, previous_command_key[1], snapshot.active_inputs, action)
+                    time.sleep(0.02)
+                    continue
+
                 if mode not in {"SETUP", "TEST"}:
                     block_reason = f"mode:{mode}"
                     if block_reason != self._last_block_reason:
                         log.info(f"GAMEPAD blocked reason={block_reason}")
                         self._last_block_reason = block_reason
-                    self._last_command_key = None
+                    if not (mode == "FAULT" and previous_was_setup_move):
+                        self._last_command_key = None
                     time.sleep(0.02)
                     continue
 
@@ -471,17 +516,7 @@ class GamepadControl:
                     else:
                         stop_key = (mode, "stop")
                         previous_command_key = self._last_command_key
-                        previous_was_setup_move = (
-                            isinstance(previous_command_key, tuple)
-                            and len(previous_command_key) == 4
-                            and previous_command_key[0] == "SETUP"
-                            and previous_command_key[2] in {
-                                "selected_forward",
-                                "selected_up",
-                                "selected_reverse",
-                                "selected_down",
-                            }
-                        )
+                        previous_was_setup_move = self._is_setup_movement_key(previous_command_key)
                         if mode == "SETUP":
                             should_stop = previous_was_setup_move
                         else:
@@ -495,28 +530,18 @@ class GamepadControl:
                                 if mode == "SETUP" and previous_was_setup_move
                                 else self.selected_target
                             )
-                            if self._last_command_key != stop_key:
-                                log.info(
-                                    f"GAMEPAD stop mode={mode} target={stop_target} "
-                                    f"input={snapshot.active_inputs} action={action}"
-                                )
                             if mode == "SETUP":
-                                all_stop = str(stop_target).lower() == "all"
-                                self._set_command_in_progress(all_stop)
-                                try:
-                                    self.mc.selected_winch_stop(
-                                        stop_target,
-                                        natural_all_after_brake=False,
-                                        wait_response=not all_stop,
-                                        repeat_brake=all_stop,
-                                    )
-                                finally:
-                                    self._set_command_in_progress(False)
+                                self._dispatch_setup_stop(mode, stop_target, snapshot.active_inputs, action)
                             else:
+                                if self._last_command_key != stop_key:
+                                    log.info(
+                                        f"GAMEPAD stop mode={mode} target={stop_target} "
+                                        f"input={snapshot.active_inputs} action={action}"
+                                    )
                                 self.mc.manual_action("stop")
-                            self._last_command_key = stop_key
-                            self._last_command_ts = time.monotonic()
-                            self._last_stop_ts = self._last_command_ts
+                                self._last_command_key = stop_key
+                                self._last_command_ts = time.monotonic()
+                                self._last_stop_ts = self._last_command_ts
                     with self._lock:
                         self.last_error = None
                     self._last_block_reason = None
@@ -546,7 +571,7 @@ class GamepadControl:
                     self.mc.emergency_stop(reason)
                 except Exception:
                     try:
-                        self.mc.stop_all(reason, as_fault=True)
+                        self.mc.safe_brake_all(reason)
                     except Exception:
                         pass
             with self._lock:
