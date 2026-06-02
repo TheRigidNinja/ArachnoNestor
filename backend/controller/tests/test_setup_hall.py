@@ -65,6 +65,7 @@ class TestMotionController(MotionController):
         self._safety = SafetyMonitor(hall_threshold=HALL_THRESHOLD, stale_timeout_s=STALE_TIMEOUT)
         self._setup_hall_active = setup_active
         self._allow_hall_below = False
+        self.all_winch_wait_response_debug = True
 
 
 class TestSetupHall(unittest.TestCase):
@@ -161,20 +162,59 @@ class TestSetupHall(unittest.TestCase):
         mc.mode = "SETUP"
         mc.manual_winch_action("all", "reverse", rpm=200, allow_hall_below=True, wait_response=True)
         self.assertEqual(mc.motor.starts, [(1, "R"), (2, "R"), (3, "R"), (4, "R")])
-        self.assertEqual(mc.motor.events[:4], [
-            ("rpm", 1, 200, False),
-            ("rpm", 2, 200, False),
-            ("rpm", 3, 200, False),
-            ("rpm", 4, 200, False),
-        ])
-        self.assertEqual(mc.motor.events[4:], [
-            ("start", 1, "R", False),
-            ("start", 2, "R", False),
-            ("start", 3, "R", False),
-            ("start", 4, "R", False),
+        self.assertEqual(mc.motor.events, [
+            ("rpm", 1, 200, True),
+            ("start", 1, "R", True),
+            ("rpm", 2, 200, True),
+            ("start", 2, "R", True),
+            ("rpm", 3, 200, True),
+            ("start", 3, "R", True),
+            ("rpm", 4, 200, True),
+            ("start", 4, "R", True),
         ])
         for winch_id in WINCH_IDS:
             self.assertTrue(mc._motor_state[winch_id]["running"])
+
+    def test_manual_winch_action_all_refresh_reasserts_start(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+        mc.manual_winch_action("all", "reverse", rpm=200, allow_hall_below=True, force=True)
+        mc.motor.events.clear()
+        mc.motor.starts.clear()
+        mc.manual_winch_action("all", "reverse", rpm=200, allow_hall_below=True, force=False)
+        self.assertEqual(mc.motor.events, [
+            ("rpm", 1, 200, True),
+            ("start", 1, "R", True),
+            ("rpm", 2, 200, True),
+            ("start", 2, "R", True),
+            ("rpm", 3, 200, True),
+            ("start", 3, "R", True),
+            ("rpm", 4, 200, True),
+            ("start", 4, "R", True),
+        ])
+        self.assertEqual(mc.motor.starts, [(1, "R"), (2, "R"), (3, "R"), (4, "R")])
+
+    def test_manual_winch_action_all_ack_logs_failures(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+
+        def write_rpm(rpm: int, motor_id: int | None = None, wait_response: bool = True):
+            mc.motor.events.append(("rpm", motor_id, rpm, wait_response))
+            return None if motor_id == 2 else b"ok"
+
+        def start(direction: str, motor_id: int | None = None, wait_response: bool = True):
+            mc.motor.events.append(("start", motor_id, direction, wait_response))
+            return None if motor_id == 3 else b"ok"
+
+        mc.motor.write_rpm = write_rpm
+        mc.motor.start = start
+        output = io.StringIO()
+        with redirect_stdout(output):
+            mc.manual_winch_action("all", "forward", rpm=200, allow_hall_below=True)
+        self.assertIn("ALL MOVE FAILED: motor 2 no ACK on RPM", output.getvalue())
+        self.assertIn("ALL MOVE FAILED: motor 3 no ACK on START", output.getvalue())
 
     def test_setup_all_run_test_commands_each_motor_with_ack_then_brakes(self):
         halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
@@ -196,6 +236,21 @@ class TestSetupHall(unittest.TestCase):
             ("stop", 3, False, True),
             ("stop", 4, False, True),
         ])
+
+    def test_setup_all_run_test_group_targets(self):
+        groups = {
+            "1+2": [1, 2],
+            "3+4": [3, 4],
+            "1+3": [1, 3],
+            "2+4": [2, 4],
+        }
+        for group, motors in groups.items():
+            with self.subTest(group=group):
+                halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+                mc = TestMotionController(halls=halls, setup_active=False)
+                mc.mode = "SETUP"
+                mc.setup_all_run_test(rpm=500, seconds=0, direction="forward", group=group)
+                self.assertEqual(mc.motor.starts, [(motor_id, "F") for motor_id in motors])
 
     def test_setup_all_run_test_blocked_outside_setup(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}

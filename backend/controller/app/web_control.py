@@ -26,6 +26,7 @@ GAMEPAD_COMMAND_REFRESH_SEC = 0.35
 GAMEPAD_STOP_REASSERT_SEC = 0.20
 GAMEPAD_WATCHDOG_SEC = 2.0
 MANUAL_FIRST_COMMAND_WAIT_RESPONSE = bool(CONFIG["motion"].get("manual_first_command_wait_response", False))
+ALL_WINCH_WAIT_RESPONSE_DEBUG = bool(CONFIG["motion"].get("all_winch_wait_response_debug", False))
 GAMEPAD_INPUTS = [
     "axis_0_neg",
     "axis_0_pos",
@@ -460,8 +461,8 @@ class GamepadControl:
                     all_target = str(self.selected_target).lower() == "all"
                     if mode == "SETUP" and action in {"selected_forward", "selected_up"}:
                         if force_command:
-                            wait_response = False if all_target else MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
-                            force_write = is_new_command
+                            wait_response = ALL_WINCH_WAIT_RESPONSE_DEBUG if all_target else MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
+                            force_write = force_command if all_target else is_new_command
                             log.info(
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
                                 f"input={snapshot.active_inputs} action={action} dir=forward rpm={rpm} "
@@ -483,8 +484,8 @@ class GamepadControl:
                             self._last_command_ts = time.monotonic()
                     elif mode == "SETUP" and action in {"selected_reverse", "selected_down"}:
                         if force_command:
-                            wait_response = False if all_target else MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
-                            force_write = is_new_command
+                            wait_response = ALL_WINCH_WAIT_RESPONSE_DEBUG if all_target else MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
+                            force_write = force_command if all_target else is_new_command
                             log.info(
                                 f"GAMEPAD command mode={mode} target={self.selected_target} "
                                 f"input={snapshot.active_inputs} action={action} dir=reverse rpm={rpm} "
@@ -873,7 +874,14 @@ def index():
               <label class="btn btn-outline-dark" for="setup-dir-rev">Reverse</label>
             </div>
             <button class="btn btn-primary w-100" onclick="post('/setup/hall', {rpm:getVal('setup-rpm'), seconds:getVal('setup-sec'), direction:getSetupDir()})">Run Hall</button>
-            <button class="btn btn-outline-warning w-100 mt-2" onclick="post('/setup/all-run-test')">Run All Winches Test</button>
+            <div class="mt-2 small text-muted">ACK group tests use 500 RPM for 2s unless payload overrides it.</div>
+            <div class="d-grid gap-1 mt-2">
+              <button class="btn btn-outline-warning" onclick="post('/setup/all-run-test', {group:'all'})">ACK Test All</button>
+              <button class="btn btn-outline-warning" onclick="post('/setup/all-run-test', {group:'1+2'})">ACK Test 1+2</button>
+              <button class="btn btn-outline-warning" onclick="post('/setup/all-run-test', {group:'3+4'})">ACK Test 3+4</button>
+              <button class="btn btn-outline-warning" onclick="post('/setup/all-run-test', {group:'1+3'})">ACK Test 1+3</button>
+              <button class="btn btn-outline-warning" onclick="post('/setup/all-run-test', {group:'2+4'})">ACK Test 2+4</button>
+            </div>
           </div>
         </div>
         <div class="card shadow-sm">
@@ -1262,9 +1270,10 @@ def setup_all_run_test():
     rpm = int(payload.get("rpm", 500))
     seconds = float(payload.get("seconds", 2.0))
     direction = str(payload.get("direction", "forward"))
+    group = payload.get("group", "all")
     try:
-        log.info(f"UI: setup all-run-test rpm={rpm} sec={seconds} dir={direction}")
-        label = mc.setup_all_run_test(rpm=rpm, seconds=seconds, direction=direction)
+        log.info(f"UI: setup all-run-test group={group} rpm={rpm} sec={seconds} dir={direction}")
+        label = mc.setup_all_run_test(rpm=rpm, seconds=seconds, direction=direction, group=group)
         return ok({"job": label})
     except Exception as exc:
         return err(str(exc))

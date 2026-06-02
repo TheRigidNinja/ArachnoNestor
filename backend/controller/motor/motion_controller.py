@@ -32,6 +32,7 @@ EVB_BACKOFF_FACTOR = CONFIG["motion"]["evb_backoff_factor"]
 USE_BUNDLE = CONFIG["motion"].get("use_bundle", True)
 USE_POWER = CONFIG["motion"].get("use_power", True)
 USE_IMU = CONFIG["motion"].get("use_imu", True)
+ALL_WINCH_WAIT_RESPONSE_DEBUG = bool(CONFIG["motion"].get("all_winch_wait_response_debug", False))
 
 log = get_logger("motor.motion_controller")
 
@@ -112,6 +113,7 @@ class MotionController:
         # Track last command per motor to avoid spamming Modbus
         self._motor_state = {w: {"running": False, "rpm": 0, "dir": None} for w in WINCH_IDS}
         self._safety = SafetyMonitor(hall_threshold=HALL_THRESHOLD, stale_timeout_s=STALE_TIMEOUT)
+        self.all_winch_wait_response_debug = ALL_WINCH_WAIT_RESPONSE_DEBUG
 
     # ------------- public API (used by web server or main) -------------
     def get_status(self) -> dict:
@@ -222,13 +224,21 @@ class MotionController:
             label=f"setup_hall_{direction}",
         )
 
-    def setup_all_run_test(self, rpm: int = 500, seconds: float = 2.0, direction: str = "forward") -> str:
+    def setup_all_run_test(
+        self,
+        rpm: int = 500,
+        seconds: float = 2.0,
+        direction: str = "forward",
+        group: str | List[int] = "all",
+    ) -> str:
         direction = direction.lower()
         if direction not in {"forward", "reverse"}:
             raise ValueError("invalid direction")
         seconds = max(0.0, float(seconds))
         abs_rpm = max(0, int(rpm))
         motor_dir = "F" if direction == "forward" else "R"
+        targets = self._parse_winch_group(group)
+        group_label = "+".join(str(motor_id) for motor_id in targets) if targets != WINCH_IDS else "all"
 
         with self._command_lock:
             with self._lock:
@@ -236,9 +246,9 @@ class MotionController:
             if not self._motion_allowed_or_stopped(allow_hall_below=True):
                 raise RuntimeError("all-winch ACK test blocked by safety")
 
-            log.info(f"ALL ACK TEST BEGIN dir={direction} rpm={abs_rpm} sec={seconds}")
+            log.info(f"ALL ACK TEST BEGIN group={group_label} dir={direction} rpm={abs_rpm} sec={seconds}")
             try:
-                for motor_id in WINCH_IDS:
+                for motor_id in targets:
                     log.info(f"ALL ACK TEST rpm motor={motor_id} rpm={abs_rpm} wait_response=True")
                     rpm_response = self.motor.write_rpm(abs_rpm, motor_id, wait_response=True)
                     if not rpm_response:
@@ -318,6 +328,18 @@ class MotionController:
             sign = 1 if direction == "forward" else -1
             target_text = str(target).lower()
             if target_text == "all":
+                if self.all_winch_wait_response_debug:
+                    if force:
+                        log.info(
+                            f"MANUAL WINCH target=all direction={direction} rpm={rpm} "
+                            f"force={force} wait_response=True"
+                        )
+                    self._command_all_winch_ack_jog(
+                        direction,
+                        rpm,
+                        allow_hall_below=allow_hall_below,
+                    )
+                    return
                 if force:
                     log.info(
                         f"MANUAL WINCH target=all direction={direction} rpm={rpm} "
@@ -631,19 +653,34 @@ class MotionController:
                 return
             abs_rpm = max(0, int(rpm))
             desired_dir = "F" if direction == "forward" else "R"
-            rpm_targets = []
-            start_targets = []
-            for motor_id in WINCH_IDS:
-                state = self._motor_state[motor_id]
-                if force or (not state["running"]) or state["rpm"] != abs_rpm:
-                    rpm_targets.append(motor_id)
-                if force or (not state["running"]) or state["dir"] != desired_dir:
-                    start_targets.append(motor_id)
+            states_match = all(
+                self._motor_state[motor_id]["running"]
+                and self._motor_state[motor_id]["rpm"] == abs_rpm
+                and self._motor_state[motor_id]["dir"] == desired_dir
+                for motor_id in WINCH_IDS
+            )
+            if states_match:
+                rpm_targets = []
+                start_targets = list(WINCH_IDS)
+                refresh = True
+            else:
+                rpm_targets = []
+                start_targets = []
+                refresh = False
+                for motor_id in WINCH_IDS:
+                    state = self._motor_state[motor_id]
+                    if force or (not state["running"]) or state["rpm"] != abs_rpm:
+                        rpm_targets.append(motor_id)
+                    if force or (not state["running"]) or state["dir"] != desired_dir:
+                        start_targets.append(motor_id)
 
             if not rpm_targets and not start_targets:
                 return
 
-            log.info(f"ALL MOVE BEGIN target=all dir={direction} rpm={abs_rpm}")
+            if refresh:
+                log.info(f"ALL MOVE REFRESH target=all dir={direction} rpm={abs_rpm}")
+            else:
+                log.info(f"ALL MOVE BEGIN target=all dir={direction} rpm={abs_rpm}")
             for motor_id in rpm_targets:
                 log.info(f"MOTOR cmd rpm motor={motor_id} rpm={abs_rpm} wait_response=False")
                 self.motor.write_rpm(abs_rpm, motor_id, wait_response=False)
@@ -656,6 +693,64 @@ class MotionController:
                 state["rpm"] = abs_rpm
                 state["dir"] = desired_dir
             log.info("ALL MOVE END")
+
+    def _command_all_winch_ack_jog(
+        self,
+        direction: str,
+        rpm: int,
+        allow_hall_below: bool = False,
+        targets: Optional[List[int]] = None,
+    ) -> None:
+        with self._command_lock:
+            if not self._motion_allowed_or_stopped(allow_hall_below):
+                return
+            abs_rpm = max(0, int(rpm))
+            desired_dir = "F" if direction == "forward" else "R"
+            motor_ids = list(WINCH_IDS if targets is None else targets)
+
+            log.info(f"ALL ACK MOVE BEGIN target=all dir={direction} rpm={abs_rpm}")
+            for motor_id in motor_ids:
+                log.info(f"ALL ACK MOVE motor {motor_id} rpm TX rpm={abs_rpm}")
+                rpm_response = self.motor.write_rpm(abs_rpm, motor_id, wait_response=True)
+                if rpm_response:
+                    log.info(f"ALL ACK MOVE motor {motor_id} rpm RX ok")
+                else:
+                    log.error(f"ALL ACK MOVE motor {motor_id} rpm RX fail")
+                    log.error(f"ALL MOVE FAILED: motor {motor_id} no ACK on RPM")
+
+                log.info(f"ALL ACK MOVE motor {motor_id} start TX dir={desired_dir}")
+                start_response = self.motor.start(desired_dir, motor_id, wait_response=True)
+                if start_response:
+                    log.info(f"ALL ACK MOVE motor {motor_id} start RX ok")
+                else:
+                    log.error(f"ALL ACK MOVE motor {motor_id} start RX fail")
+                    log.error(f"ALL MOVE FAILED: motor {motor_id} no ACK on START")
+
+                state = self._motor_state[motor_id]
+                command_ok = bool(rpm_response) and bool(start_response)
+                state["running"] = command_ok
+                state["rpm"] = abs_rpm if command_ok else 0
+                state["dir"] = desired_dir if command_ok else None
+            log.info("ALL ACK MOVE END")
+
+    def _parse_winch_group(self, group: str | List[int]) -> List[int]:
+        if isinstance(group, list):
+            targets = [int(motor_id) for motor_id in group]
+        else:
+            group_text = str(group).strip().lower()
+            groups = {
+                "all": list(WINCH_IDS),
+                "1+2": [1, 2],
+                "3+4": [3, 4],
+                "1+3": [1, 3],
+                "2+4": [2, 4],
+            }
+            if group_text not in groups:
+                raise ValueError("invalid winch test group")
+            targets = groups[group_text]
+        if not targets or any(motor_id not in WINCH_IDS for motor_id in targets):
+            raise ValueError("invalid winch test group")
+        return targets
 
     def _motion_allowed_or_stopped(self, allow_hall_below: bool) -> bool:
         fault_reason = None
