@@ -218,7 +218,7 @@ class GamepadControl:
                 self._monitor_disabled = True
             self._stop.set()
         try:
-            self.mc.manual_action("stop")
+            self.mc.brake_all_now("controller stop", as_fault=False)
         except Exception:
             pass
         if disable_monitor:
@@ -263,7 +263,7 @@ class GamepadControl:
                 finally:
                     self._set_command_in_progress(False)
             else:
-                self.mc.manual_action("stop")
+                self.mc.brake_all_now("controller stop", as_fault=False)
         except Exception:
             pass
         now = time.monotonic()
@@ -359,7 +359,7 @@ class GamepadControl:
         try:
             self.mc.selected_winch_stop(
                 stop_target,
-                natural_all_after_brake=False,
+                delayed_brake_all=False,
                 wait_response=not all_stop,
                 repeat_brake=all_stop,
             )
@@ -426,7 +426,7 @@ class GamepadControl:
                         self._last_block_reason = block_reason
                     if self._last_command_key != ("disabled", "stop"):
                         try:
-                            self.mc.manual_action("stop")
+                            self.mc.brake_all_now("controller disabled", as_fault=False)
                         except Exception:
                             pass
                         self._last_command_key = ("disabled", "stop")
@@ -539,7 +539,7 @@ class GamepadControl:
                                         f"GAMEPAD stop mode={mode} target={stop_target} "
                                         f"input={snapshot.active_inputs} action={action}"
                                     )
-                                self.mc.manual_action("stop")
+                                self.mc.brake_all_now("controller stop", as_fault=False)
                                 self._last_command_key = stop_key
                                 self._last_command_ts = time.monotonic()
                                 self._last_stop_ts = self._last_command_ts
@@ -552,7 +552,7 @@ class GamepadControl:
                         f"input={snapshot.active_inputs} action={action} error={exc}"
                     )
                     try:
-                        self.mc.manual_action("stop")
+                        self.mc.brake_all_now("controller dispatch error", as_fault=False)
                     except Exception:
                         pass
                     self._last_command_key = None
@@ -585,7 +585,7 @@ class GamepadControl:
                 send_final_stop = not self._monitor_disabled
             if send_final_stop:
                 try:
-                    self.mc.manual_action("stop")
+                    self.mc.brake_all_now("controller final stop", as_fault=False)
                 except Exception:
                     pass
             with self._lock:
@@ -1211,7 +1211,8 @@ def mode_test():
 def clear_fault():
     try:
         log.info("UI: clear fault")
-        gamepad_control.stop()
+        gamepad_control.disable_without_motor_command()
+        mc.brake_all_now("clear fault", as_fault=False)
         mc.clear_fault()
         return ok()
     except Exception as exc:

@@ -28,6 +28,7 @@ DEFAULTS: Dict[str, Any] = {
         "manual_command_gap": 0.06,
         "manual_first_command_wait_response": True,
         "all_winch_wait_response_debug": False,
+        "setup_all_run_test_wait_response": False,
         "log_modbus_frames": True,
         "device_address": 1,
     },
