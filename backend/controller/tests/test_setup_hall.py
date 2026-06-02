@@ -218,22 +218,26 @@ class TestSetupHall(unittest.TestCase):
         self.assertIn("ALL MOVE FAILED: motor 2 no ACK on RPM", output.getvalue())
         self.assertIn("ALL MOVE FAILED: motor 3 no ACK on START", output.getvalue())
 
-    def test_setup_all_run_test_commands_each_motor_without_ack_then_brakes(self):
+    def test_setup_all_run_test_commands_each_motor_with_ack_then_brakes(self):
         halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.mode = "SETUP"
-        label = mc.setup_all_run_test(rpm=500, seconds=0, direction="forward")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            label = mc.setup_all_run_test(rpm=500, seconds=0, direction="forward")
         self.assertEqual(label, "setup_all_run_test")
         self.assertEqual(mc.motor.events, [
-            ("rpm", 1, 500, False),
-            ("start", 1, "F", False),
-            ("rpm", 2, 500, False),
-            ("start", 2, "F", False),
-            ("rpm", 3, 500, False),
-            ("start", 3, "F", False),
-            ("rpm", 4, 500, False),
-            ("start", 4, "F", False),
+            ("rpm", 1, 500, True),
+            ("start", 1, "F", True),
+            ("rpm", 2, 500, True),
+            ("start", 2, "F", True),
+            ("rpm", 3, 500, True),
+            ("start", 3, "F", True),
+            ("rpm", 4, 500, True),
+            ("start", 4, "F", True),
         ] + brake_events(repeat=3))
+        self.assertIn("ALL RUN TEST motor=3 rpm ACK ok", output.getvalue())
+        self.assertIn("ALL RUN TEST motor=3 start ACK ok", output.getvalue())
 
     def test_setup_all_run_test_debug_ack_failure_brakes_and_faults(self):
         halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
@@ -333,8 +337,8 @@ class TestSetupHall(unittest.TestCase):
                 )
                 expected_startup_events = []
                 for motor_id in motors:
-                    expected_startup_events.append(("rpm", motor_id, 500, False))
-                    expected_startup_events.append(("start", motor_id, "F", False))
+                    expected_startup_events.append(("rpm", motor_id, 500, True))
+                    expected_startup_events.append(("start", motor_id, "F", True))
                 self.assertEqual(mc.motor.events[:first_stop_index], expected_startup_events)
 
     def test_setup_all_run_test_blocked_outside_setup(self):

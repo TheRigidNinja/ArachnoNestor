@@ -24,6 +24,7 @@ log = get_logger("app.web_control")
 GAMEPAD_MAPPING_PATH = Path(__file__).resolve().parents[1] / "config" / "gamepad_mapping.json"
 GAMEPAD_COMMAND_REFRESH_SEC = 0.35
 GAMEPAD_STOP_REASSERT_SEC = 0.20
+GAMEPAD_ALL_STOP_DEBOUNCE_SEC = 0.20
 GAMEPAD_WATCHDOG_SEC = 2.0
 MANUAL_FIRST_COMMAND_WAIT_RESPONSE = bool(CONFIG["motion"].get("manual_first_command_wait_response", False))
 ALL_WINCH_WAIT_RESPONSE_DEBUG = bool(CONFIG["motion"].get("all_winch_wait_response_debug", False))
@@ -150,6 +151,7 @@ class GamepadControl:
         self._last_command_key = None
         self._last_command_ts = 0.0
         self._last_stop_ts = 0.0
+        self._all_stop_pending_since = None
         self._last_block_reason = None
         self._command_in_progress = False
 
@@ -257,6 +259,7 @@ class GamepadControl:
             self._last_command_ts = 0.0
             self._last_stop_ts = 0.0
             self._command_in_progress = False
+            self._all_stop_pending_since = None
         self._stop.set()
 
     def _set_command_in_progress(self, value: bool):
@@ -503,6 +506,7 @@ class GamepadControl:
                     force_command = is_new_command or refresh_command
                     all_target = str(self.selected_target).lower() == "all"
                     if mode == "SETUP" and action in {"selected_forward", "selected_up"}:
+                        self._all_stop_pending_since = None
                         if force_command:
                             wait_response = ALL_WINCH_WAIT_RESPONSE_DEBUG if all_target else MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
                             force_write = force_command if all_target else is_new_command
@@ -526,6 +530,7 @@ class GamepadControl:
                             self._last_command_key = command_key
                             self._last_command_ts = time.monotonic()
                     elif mode == "SETUP" and action in {"selected_reverse", "selected_down"}:
+                        self._all_stop_pending_since = None
                         if force_command:
                             wait_response = ALL_WINCH_WAIT_RESPONSE_DEBUG if all_target else MANUAL_FIRST_COMMAND_WAIT_RESPONSE and is_new_command
                             force_write = force_command if all_target else is_new_command
@@ -575,6 +580,20 @@ class GamepadControl:
                                 else self.selected_target
                             )
                             if mode == "SETUP":
+                                all_setup_release = (
+                                    previous_was_setup_move
+                                    and str(stop_target).lower() == "all"
+                                )
+                                if all_setup_release:
+                                    if self._all_stop_pending_since is None:
+                                        self._all_stop_pending_since = now
+                                        log.info("GAMEPAD target=all stop debounce begin")
+                                        time.sleep(0.02)
+                                        continue
+                                    if (now - self._all_stop_pending_since) < GAMEPAD_ALL_STOP_DEBOUNCE_SEC:
+                                        time.sleep(0.02)
+                                        continue
+                                self._all_stop_pending_since = None
                                 self._dispatch_setup_stop(mode, stop_target, snapshot.active_inputs, action)
                             else:
                                 if self._last_command_key != stop_key:

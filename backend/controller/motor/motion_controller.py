@@ -325,20 +325,28 @@ class MotionController:
                 for motor_id in targets:
                     log.info(f"ALL RUN TEST rpm motor={motor_id} rpm={abs_rpm} wait_response={wait_response}")
                     rpm_response = self.motor.write_rpm(abs_rpm, motor_id, wait_response=wait_response)
-                    if wait_response and not rpm_response:
-                        command_failed = True
-                        log.error(f"RPM FAILED: no ACK from motor {motor_id}")
-                        state = self._motor_state[motor_id]
-                        state["running"] = False
-                        state["rpm"] = 0
-                        state["dir"] = None
-                        break
+                    if wait_response:
+                        if rpm_response:
+                            log.info(f"ALL RUN TEST motor={motor_id} rpm ACK ok")
+                        else:
+                            command_failed = True
+                            log.error(f"ALL RUN TEST motor={motor_id} rpm ACK fail")
+                            log.error(f"RPM FAILED: no ACK from motor {motor_id}")
+                            state = self._motor_state[motor_id]
+                            state["running"] = False
+                            state["rpm"] = 0
+                            state["dir"] = None
+                            break
 
                     log.info(f"ALL RUN TEST start motor={motor_id} dir={motor_dir} wait_response={wait_response}")
                     start_response = self.motor.start(motor_dir, motor_id, wait_response=wait_response)
-                    if wait_response and not start_response:
-                        command_failed = True
-                        log.error(f"START FAILED: no ACK from motor {motor_id}")
+                    if wait_response:
+                        if start_response:
+                            log.info(f"ALL RUN TEST motor={motor_id} start ACK ok")
+                        else:
+                            command_failed = True
+                            log.error(f"ALL RUN TEST motor={motor_id} start ACK fail")
+                            log.error(f"START FAILED: no ACK from motor {motor_id}")
 
                     state = self._motor_state[motor_id]
                     command_ok = True if not wait_response else bool(rpm_response) and bool(start_response)
