@@ -296,10 +296,22 @@ class TestSetupHall(unittest.TestCase):
             time.sleep(0.01)
 
         self.assertTrue(mc._exclusive_test_active)
+        self.assertTrue(mc._allow_hall_below)
         mc._stop_requested.set()
         thread.join(timeout=0.5)
         self.assertTrue(finished.is_set())
         self.assertFalse(mc._exclusive_test_active)
+        self.assertFalse(mc._allow_hall_below)
+
+    def test_setup_all_run_test_logs_hall_bypass_active_and_cleared(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            mc.setup_all_run_test(rpm=500, seconds=0, direction="forward")
+        self.assertIn("ALL RUN TEST hall safety bypass active", output.getvalue())
+        self.assertIn("ALL RUN TEST hall safety bypass cleared", output.getvalue())
 
     def test_setup_all_run_test_group_targets(self):
         groups = {

@@ -308,6 +308,8 @@ class MotionController:
         command_failed = False
         with self._lock:
             self._exclusive_test_active = True
+            self._allow_hall_below = True
+        log.info("ALL RUN TEST hall safety bypass active")
         try:
             with self._command_lock:
                 with self._lock:
@@ -366,6 +368,8 @@ class MotionController:
         finally:
             with self._lock:
                 self._exclusive_test_active = False
+                self._allow_hall_below = False
+            log.info("ALL RUN TEST hall safety bypass cleared")
 
     def test_up(self, rpm: int = 350, seconds: float = 10.0) -> str:
         with self._lock:
@@ -1076,7 +1080,9 @@ class MotionController:
                             status = self._safety.evaluate(self.last_halls, self.last_update)
                             if not status.can_move:
                                 if status.reason and status.reason.startswith("hall below"):
-                                    if self._allow_hall_below:
+                                    if self._exclusive_test_active:
+                                        pass
+                                    elif self._allow_hall_below:
                                         pass
                                     elif self._setup_hall_active:
                                         self._stop_motors_locked(
