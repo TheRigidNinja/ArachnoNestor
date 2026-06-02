@@ -98,6 +98,7 @@ class MotionController:
 
         # Background poller
         self._stop_event = threading.Event()
+        self._stop_requested = threading.Event()
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
 
@@ -164,6 +165,7 @@ class MotionController:
                 self.fault = None
                 self.mode = "IDLE"
                 self.setup_activated = False
+                self._stop_requested.clear()
                 self._stop_motors_locked("fault cleared", force=True)
 
     def stop_all(
@@ -196,9 +198,43 @@ class MotionController:
             self.fault = reason
             self.mode = "FAULT"
 
+    def brake_all_now(
+        self,
+        reason: str = "stop",
+        as_fault: bool = False,
+        repeat: int = 3,
+        wait_response_first: bool = True,
+    ) -> None:
+        """Immediate braking stop for UI stop paths and cancellable tests."""
+        log.warning(f"STOP REQUESTED: {reason}")
+        self._stop_requested.set()
+        repeat = max(1, int(repeat))
+        with self._command_lock:
+            log.warning(f"BRAKE ALL BEGIN reason={reason} repeat={repeat} wait_response_first={wait_response_first}")
+            for pass_index in range(repeat):
+                wait_response = bool(wait_response_first and pass_index == 0)
+                for motor_id in WINCH_IDS:
+                    stop_response = self._stop_motor(
+                        motor_id,
+                        force=True,
+                        wait_response=wait_response,
+                        brake=True,
+                    )
+                    if wait_response:
+                        if stop_response:
+                            log.info(f"BRAKE motor={motor_id} ACK ok")
+                        else:
+                            log.error(f"BRAKE motor={motor_id} ACK fail")
+            with self._lock:
+                self._allow_hall_below = False
+                if as_fault:
+                    self.fault = reason
+                    self.mode = "FAULT"
+            log.warning("BRAKE ALL END")
+
     def emergency_stop(self, reason: str = "emergency stop") -> None:
         """Force-stop and enter FAULT regardless of current state."""
-        self.safe_brake_all(reason)
+        self.brake_all_now(reason, as_fault=True)
 
     def setup_jog(self, rpm: int = 200, seconds: float = 1.0) -> str:
         with self._lock:
@@ -240,6 +276,8 @@ class MotionController:
         targets = self._parse_winch_group(group)
         group_label = "+".join(str(motor_id) for motor_id in targets) if targets != WINCH_IDS else "all"
 
+        self._stop_requested.clear()
+        command_failed = False
         with self._command_lock:
             with self._lock:
                 self._ensure_ready("SETUP")
@@ -247,27 +285,48 @@ class MotionController:
                 raise RuntimeError("all-winch ACK test blocked by safety")
 
             log.info(f"ALL ACK TEST BEGIN group={group_label} dir={direction} rpm={abs_rpm} sec={seconds}")
-            try:
-                for motor_id in targets:
-                    log.info(f"ALL ACK TEST rpm motor={motor_id} rpm={abs_rpm} wait_response=True")
-                    rpm_response = self.motor.write_rpm(abs_rpm, motor_id, wait_response=True)
-                    if not rpm_response:
-                        log.error(f"RPM FAILED: no ACK from motor {motor_id}")
-
-                    log.info(f"ALL ACK TEST start motor={motor_id} dir={motor_dir} wait_response=True")
-                    start_response = self.motor.start(motor_dir, motor_id, wait_response=True)
-                    if not start_response:
-                        log.error(f"START FAILED: no ACK from motor {motor_id}")
-
+            for motor_id in targets:
+                log.info(f"ALL ACK TEST rpm motor={motor_id} rpm={abs_rpm} wait_response=True")
+                rpm_response = self.motor.write_rpm(abs_rpm, motor_id, wait_response=True)
+                if not rpm_response:
+                    command_failed = True
+                    log.error(f"RPM FAILED: no ACK from motor {motor_id}")
                     state = self._motor_state[motor_id]
-                    state["running"] = bool(start_response)
-                    state["rpm"] = abs_rpm if start_response else 0
-                    state["dir"] = motor_dir if start_response else None
+                    state["running"] = False
+                    state["rpm"] = 0
+                    state["dir"] = None
+                    break
 
-                time.sleep(seconds)
-            finally:
-                self._brake_stop_targets(list(WINCH_IDS), wait_response=False)
+                log.info(f"ALL ACK TEST start motor={motor_id} dir={motor_dir} wait_response=True")
+                start_response = self.motor.start(motor_dir, motor_id, wait_response=True)
+                if not start_response:
+                    command_failed = True
+                    log.error(f"START FAILED: no ACK from motor {motor_id}")
+
+                state = self._motor_state[motor_id]
+                command_ok = bool(rpm_response) and bool(start_response)
+                state["running"] = command_ok
+                state["rpm"] = abs_rpm if command_ok else 0
+                state["dir"] = motor_dir if command_ok else None
+
+                if command_failed:
+                    break
+
+        if command_failed:
+            self.brake_all_now("all-run-test command failure", as_fault=True)
+            log.info("ALL ACK TEST END")
+            raise RuntimeError("all-run-test command failure")
+
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self._stop_requested.is_set():
+                self.brake_all_now("all-run-test stop requested")
                 log.info("ALL ACK TEST END")
+                return "setup_all_run_test"
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+        self.brake_all_now("all-run-test finished")
+        log.info("ALL ACK TEST END")
         return "setup_all_run_test"
 
     def test_up(self, rpm: int = 350, seconds: float = 10.0) -> str:

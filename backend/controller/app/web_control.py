@@ -1221,8 +1221,8 @@ def clear_fault():
 def stop():
     reason = request.json.get("reason", "user stop") if request.is_json else "user stop"
     log.warning(f"UI: stop ({reason})")
-    gamepad_control.stop()
-    mc.stop_all(reason)
+    gamepad_control.disable_without_motor_command()
+    mc.brake_all_now(reason, as_fault=False)
     return ok({"stopped": True, "reason": reason})
 
 
@@ -1231,7 +1231,7 @@ def stop_all_fault():
     reason = request.json.get("reason", "emergency stop") if request.is_json else "emergency stop"
     log.warning(f"UI: emergency stop ({reason})")
     gamepad_control.disable_without_motor_command()
-    mc.emergency_stop(reason)
+    mc.brake_all_now(reason, as_fault=True)
     return ok({"stopped": True, "fault": True, "reason": reason})
 
 

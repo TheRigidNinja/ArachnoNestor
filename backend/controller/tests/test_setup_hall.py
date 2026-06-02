@@ -8,6 +8,14 @@ from motor.motion_controller import DIRECTION_MAP, HALL_THRESHOLD, STALE_TIMEOUT
 from motor.safety import SafetyMonitor
 
 
+def brake_calls(repeat: int = 2, wait_response_first: bool = False):
+    calls = []
+    for pass_index in range(repeat):
+        wait_response = bool(wait_response_first and pass_index == 0)
+        calls.extend((motor_id, wait_response, True) for motor_id in WINCH_IDS)
+    return calls
+
+
 class DummyMotor:
     def __init__(self):
         self.started = False
@@ -50,6 +58,7 @@ class TestMotionController(MotionController):
     def __init__(self, halls, setup_active):
         self._lock = threading.Lock()
         self._command_lock = threading.RLock()
+        self._stop_requested = threading.Event()
         self.mode = "SETUP"
         self.fault = None
         self.last_halls = halls
@@ -102,16 +111,7 @@ class TestSetupHall(unittest.TestCase):
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.last_update = time.time() - STALE_TIMEOUT - 1.0
         mc._command_motors(DIRECTION_MAP["up"], rpm=200)
-        self.assertEqual(mc.motor.stop_calls, [
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-        ])
+        self.assertEqual(mc.motor.stop_calls, brake_calls())
         self.assertEqual(mc.mode, "FAULT")
 
     def test_hall_job_safety_fault_brakes_without_natural_stop(self):
@@ -119,16 +119,7 @@ class TestSetupHall(unittest.TestCase):
         mc = TestMotionController(halls=halls, setup_active=True)
         mc.last_update = time.time() - STALE_TIMEOUT - 1.0
         mc._run_hall_job(DIRECTION_MAP["up"], rpm=200, max_seconds=0.0, label="test")
-        self.assertEqual(mc.motor.stop_calls, [
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-        ])
+        self.assertEqual(mc.motor.stop_calls, brake_calls())
         self.assertEqual(mc.mode, "FAULT")
 
     def test_idle_mode_does_not_command_motors(self):
@@ -231,11 +222,61 @@ class TestSetupHall(unittest.TestCase):
             ("start", 3, "F", True),
             ("rpm", 4, 500, True),
             ("start", 4, "F", True),
+            ("stop", 1, True, True),
+            ("stop", 2, True, True),
+            ("stop", 3, True, True),
+            ("stop", 4, True, True),
+            ("stop", 1, False, True),
+            ("stop", 2, False, True),
+            ("stop", 3, False, True),
+            ("stop", 4, False, True),
             ("stop", 1, False, True),
             ("stop", 2, False, True),
             ("stop", 3, False, True),
             ("stop", 4, False, True),
         ])
+
+    def test_setup_all_run_test_rpm_ack_failure_brakes_and_faults(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+
+        def write_rpm(rpm: int, motor_id: int | None = None, wait_response: bool = True):
+            mc.motor.events.append(("rpm", motor_id, rpm, wait_response))
+            return None if motor_id == 2 else b"ok"
+
+        mc.motor.write_rpm = write_rpm
+        with self.assertRaises(RuntimeError):
+            mc.setup_all_run_test(rpm=500, seconds=0.2, direction="forward")
+
+        self.assertEqual(mc.mode, "FAULT")
+        self.assertEqual(mc.fault, "all-run-test command failure")
+        self.assertIn(("start", 1, "F", True), mc.motor.events)
+        self.assertNotIn(("start", 2, "F", True), mc.motor.events)
+        self.assertNotIn(("start", 3, "F", True), mc.motor.events)
+        self.assertEqual(mc.motor.stop_calls, brake_calls(repeat=3, wait_response_first=True))
+
+    def test_setup_all_run_test_stop_request_exits_early(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+        finished = threading.Event()
+
+        def run_test():
+            mc.setup_all_run_test(rpm=500, seconds=1.0, direction="forward")
+            finished.set()
+
+        thread = threading.Thread(target=run_test)
+        start_time = time.monotonic()
+        thread.start()
+        while len(mc.motor.starts) < len(WINCH_IDS) and time.monotonic() - start_time < 0.5:
+            time.sleep(0.01)
+        mc._stop_requested.set()
+        thread.join(timeout=0.5)
+
+        self.assertTrue(finished.is_set())
+        self.assertLess(time.monotonic() - start_time, 1.0)
+        self.assertEqual(mc.motor.stop_calls, brake_calls(repeat=3, wait_response_first=True))
 
     def test_setup_all_run_test_group_targets(self):
         groups = {
@@ -271,49 +312,38 @@ class TestSetupHall(unittest.TestCase):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.stop_all("fault stop", as_fault=True)
-        self.assertEqual(mc.motor.stop_calls, [
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-        ])
+        self.assertEqual(mc.motor.stop_calls, brake_calls())
         self.assertEqual(mc.mode, "FAULT")
         self.assertEqual(mc.fault, "fault stop")
 
-    def test_emergency_stop_uses_brake_without_waiting(self):
+    def test_brake_all_now_waits_first_pass_then_repeats(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.brake_all_now("test stop", as_fault=False)
+        self.assertEqual(mc.motor.stop_calls, brake_calls(repeat=3, wait_response_first=True))
+        self.assertEqual(mc.mode, "SETUP")
+        self.assertIsNone(mc.fault)
+
+    def test_brake_all_now_as_fault_sets_fault(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.brake_all_now("test fault", as_fault=True)
+        self.assertEqual(mc.motor.stop_calls, brake_calls(repeat=3, wait_response_first=True))
+        self.assertEqual(mc.mode, "FAULT")
+        self.assertEqual(mc.fault, "test fault")
+
+    def test_emergency_stop_uses_brake_with_ack_first(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.emergency_stop("test emergency")
-        self.assertEqual(mc.motor.stop_calls, [
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-        ])
+        self.assertEqual(mc.motor.stop_calls, brake_calls(repeat=3, wait_response_first=True))
         self.assertEqual(mc.mode, "FAULT")
 
     def test_safe_brake_all_repeats_brake_and_faults(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.safe_brake_all("test fault")
-        self.assertEqual(mc.motor.stop_calls, [
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-        ])
+        self.assertEqual(mc.motor.stop_calls, brake_calls())
         self.assertEqual(mc.mode, "FAULT")
         self.assertEqual(mc.fault, "test fault")
 
@@ -334,16 +364,7 @@ class TestSetupHall(unittest.TestCase):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
         mc = TestMotionController(halls=halls, setup_active=False)
         mc.selected_winch_stop("all")
-        self.assertEqual(mc.motor.stop_calls, [
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-            (1, False, True),
-            (2, False, True),
-            (3, False, True),
-            (4, False, True),
-        ])
+        self.assertEqual(mc.motor.stop_calls, brake_calls())
 
     def test_selected_winch_stop_logs_no_ack(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
