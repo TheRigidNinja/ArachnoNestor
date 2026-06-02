@@ -741,7 +741,8 @@ def controller_target():
 
 @app.post("/controller/stop")
 def controller_stop():
-    gamepad_control.stop(disable_monitor=True)
+    gamepad_control.disable_without_motor_command()
+    mc.brake_all_now("controller stop", as_fault=False)
     return ok({"controller": gamepad_control.status()})
 
 

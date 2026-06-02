@@ -203,7 +203,7 @@ class MotionController:
         reason: str = "stop",
         as_fault: bool = False,
         repeat: int = 3,
-        wait_response_first: bool = True,
+        wait_response_first: bool = False,
     ) -> None:
         """Immediate braking stop for UI stop paths and cancellable tests."""
         log.warning(f"STOP REQUESTED: {reason}")
