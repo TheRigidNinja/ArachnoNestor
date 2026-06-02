@@ -100,6 +100,7 @@ class MotionController:
         # Background poller
         self._stop_event = threading.Event()
         self._stop_requested = threading.Event()
+        self._exclusive_test_active = False
         self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._poll_thread.start()
 
@@ -141,6 +142,7 @@ class MotionController:
                 "threshold": HALL_THRESHOLD,
                 "last_update": self.last_update,
                 "job_active": self._job_thread is not None and self._job_thread.is_alive(),
+                "exclusive_test_active": self._exclusive_test_active,
             }
 
     def set_mode(self, mode: str) -> None:
@@ -152,17 +154,29 @@ class MotionController:
                 # If already faulted, only allow clear_fault to exit
                 if self.fault and mode != "FAULT":
                     raise RuntimeError("in FAULT; clear_fault first")
+                if self._exclusive_test_active:
+                    raise RuntimeError("exclusive setup test active; use /stop or /stop/all")
                 if mode == "IDLE":
                     self.setup_activated = False
                 # Stop motors before switching
-                self._stop_motors_locked("mode change", force=True, brake=True)
+                self._stop_motors_locked(
+                    "mode change",
+                    force=True,
+                    brake=True,
+                    source="set_mode",
+                )
                 self.mode = mode
                 if mode == "SETUP":
                     self.setup_activated = True
 
     def clear_fault(self) -> None:
         with self._command_lock:
-            self._brake_stop_targets(list(WINCH_IDS), wait_response=False)
+            self._brake_stop_targets(
+                list(WINCH_IDS),
+                wait_response=False,
+                source="clear_fault",
+                reason="clear fault",
+            )
             with self._lock:
                 self.fault = None
                 self.mode = "IDLE"
@@ -175,25 +189,32 @@ class MotionController:
         as_fault: bool = False,
         wait_response: bool = False,
         brake: bool = True,
+        source: str = "stop_all",
     ) -> None:
         """Stop motors. If as_fault=True, enter FAULT mode and record reason."""
         if as_fault:
-            self.safe_brake_all(reason)
+            self.safe_brake_all(reason, source=source)
             return
         with self._command_lock:
             with self._lock:
-                self._stop_motors_locked(reason, force=True, wait_response=wait_response, brake=brake)
+                self._stop_motors_locked(
+                    reason,
+                    force=True,
+                    wait_response=wait_response,
+                    brake=brake,
+                    source=source,
+                )
                 self._allow_hall_below = False
 
-    def safe_brake_all(self, reason: str) -> None:
+    def safe_brake_all(self, reason: str, source: str = "safe_brake_all") -> None:
         """Repeated braking stop that is safe to call from fault paths."""
         with self._command_lock:
-            self._safe_brake_all_under_command_lock(reason)
+            self._safe_brake_all_under_command_lock(reason, source=source)
 
-    def _safe_brake_all_under_command_lock(self, reason: str) -> None:
-        self._brake_stop_targets(list(WINCH_IDS), wait_response=False)
+    def _safe_brake_all_under_command_lock(self, reason: str, source: str = "safe_brake_all") -> None:
+        self._brake_stop_targets(list(WINCH_IDS), wait_response=False, source=source, reason=reason)
         time.sleep(0.1)
-        self._brake_stop_targets(list(WINCH_IDS), wait_response=False)
+        self._brake_stop_targets(list(WINCH_IDS), wait_response=False, source=source, reason=reason)
         with self._lock:
             self._allow_hall_below = False
             self.fault = reason
@@ -205,13 +226,17 @@ class MotionController:
         as_fault: bool = False,
         repeat: int = 3,
         wait_response_first: bool = False,
+        source: str = "brake_all_now",
     ) -> None:
         """Immediate braking stop for UI stop paths and cancellable tests."""
         log.warning(f"STOP REQUESTED: {reason}")
         self._stop_requested.set()
         repeat = max(1, int(repeat))
         with self._command_lock:
-            log.warning(f"BRAKE ALL BEGIN reason={reason} repeat={repeat} wait_response_first={wait_response_first}")
+            log.warning(
+                f"BRAKE ALL BEGIN source={source} reason={reason} "
+                f"repeat={repeat} wait_response_first={wait_response_first}"
+            )
             for pass_index in range(repeat):
                 wait_response = bool(wait_response_first and pass_index == 0)
                 for motor_id in WINCH_IDS:
@@ -220,6 +245,8 @@ class MotionController:
                         force=True,
                         wait_response=wait_response,
                         brake=True,
+                        source=source,
+                        reason=reason,
                     )
                     if wait_response:
                         if stop_response:
@@ -233,9 +260,9 @@ class MotionController:
                     self.mode = "FAULT"
             log.warning("BRAKE ALL END")
 
-    def emergency_stop(self, reason: str = "emergency stop") -> None:
+    def emergency_stop(self, reason: str = "emergency stop", source: str = "emergency_stop") -> None:
         """Force-stop and enter FAULT regardless of current state."""
-        self.brake_all_now(reason, as_fault=True)
+        self.brake_all_now(reason, as_fault=True, source=source)
 
     def setup_jog(self, rpm: int = 200, seconds: float = 1.0) -> str:
         with self._lock:
@@ -279,60 +306,66 @@ class MotionController:
 
         self._stop_requested.clear()
         command_failed = False
-        with self._command_lock:
-            with self._lock:
-                self._ensure_ready("SETUP")
-            if not self._motion_allowed_or_stopped(allow_hall_below=True):
-                raise RuntimeError("all-winch ACK test blocked by safety")
+        with self._lock:
+            self._exclusive_test_active = True
+        try:
+            with self._command_lock:
+                with self._lock:
+                    self._ensure_ready("SETUP")
+                if not self._motion_allowed_or_stopped(allow_hall_below=True):
+                    raise RuntimeError("all-winch ACK test blocked by safety")
 
-            wait_response = SETUP_ALL_RUN_TEST_WAIT_RESPONSE
-            log.info(
-                f"ALL RUN TEST BEGIN group={group_label} dir={direction} "
-                f"rpm={abs_rpm} sec={seconds} wait_response={wait_response}"
-            )
-            for motor_id in targets:
-                log.info(f"ALL RUN TEST rpm motor={motor_id} rpm={abs_rpm} wait_response={wait_response}")
-                rpm_response = self.motor.write_rpm(abs_rpm, motor_id, wait_response=wait_response)
-                if wait_response and not rpm_response:
-                    command_failed = True
-                    log.error(f"RPM FAILED: no ACK from motor {motor_id}")
+                wait_response = SETUP_ALL_RUN_TEST_WAIT_RESPONSE
+                log.info(
+                    f"ALL RUN TEST BEGIN group={group_label} dir={direction} "
+                    f"rpm={abs_rpm} sec={seconds} wait_response={wait_response}"
+                )
+                for motor_id in targets:
+                    log.info(f"ALL RUN TEST rpm motor={motor_id} rpm={abs_rpm} wait_response={wait_response}")
+                    rpm_response = self.motor.write_rpm(abs_rpm, motor_id, wait_response=wait_response)
+                    if wait_response and not rpm_response:
+                        command_failed = True
+                        log.error(f"RPM FAILED: no ACK from motor {motor_id}")
+                        state = self._motor_state[motor_id]
+                        state["running"] = False
+                        state["rpm"] = 0
+                        state["dir"] = None
+                        break
+
+                    log.info(f"ALL RUN TEST start motor={motor_id} dir={motor_dir} wait_response={wait_response}")
+                    start_response = self.motor.start(motor_dir, motor_id, wait_response=wait_response)
+                    if wait_response and not start_response:
+                        command_failed = True
+                        log.error(f"START FAILED: no ACK from motor {motor_id}")
+
                     state = self._motor_state[motor_id]
-                    state["running"] = False
-                    state["rpm"] = 0
-                    state["dir"] = None
-                    break
+                    command_ok = True if not wait_response else bool(rpm_response) and bool(start_response)
+                    state["running"] = command_ok
+                    state["rpm"] = abs_rpm if command_ok else 0
+                    state["dir"] = motor_dir if command_ok else None
 
-                log.info(f"ALL RUN TEST start motor={motor_id} dir={motor_dir} wait_response={wait_response}")
-                start_response = self.motor.start(motor_dir, motor_id, wait_response=wait_response)
-                if wait_response and not start_response:
-                    command_failed = True
-                    log.error(f"START FAILED: no ACK from motor {motor_id}")
+                    if command_failed:
+                        break
 
-                state = self._motor_state[motor_id]
-                command_ok = True if not wait_response else bool(rpm_response) and bool(start_response)
-                state["running"] = command_ok
-                state["rpm"] = abs_rpm if command_ok else 0
-                state["dir"] = motor_dir if command_ok else None
-
-                if command_failed:
-                    break
-
-        if command_failed:
-            self.brake_all_now("all-run-test command failure", as_fault=True)
-            log.info("ALL RUN TEST END")
-            raise RuntimeError("all-run-test command failure")
-
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if self._stop_requested.is_set():
-                self.brake_all_now("all-run-test stop requested")
+            if command_failed:
+                self.brake_all_now("all-run-test command failure", as_fault=True, source="setup_all_run_test")
                 log.info("ALL RUN TEST END")
-                return "setup_all_run_test"
-            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                raise RuntimeError("all-run-test command failure")
 
-        self.brake_all_now("all-run-test finished")
-        log.info("ALL RUN TEST END")
-        return "setup_all_run_test"
+            deadline = time.monotonic() + seconds
+            while time.monotonic() < deadline:
+                if self._stop_requested.is_set():
+                    self.brake_all_now("all-run-test stop requested", source="setup_all_run_test")
+                    log.info("ALL RUN TEST END")
+                    return "setup_all_run_test"
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+            self.brake_all_now("all-run-test finished", source="setup_all_run_test")
+            log.info("ALL RUN TEST END")
+            return "setup_all_run_test"
+        finally:
+            with self._lock:
+                self._exclusive_test_active = False
 
     def test_up(self, rpm: int = 350, seconds: float = 10.0) -> str:
         with self._lock:
@@ -361,7 +394,12 @@ class MotionController:
     def manual_action(self, action: str, rpm: int = 250, wait_response: bool = True) -> None:
         action = action.lower()
         if action in {"", "none", "stop"}:
-            self.stop_all("manual controller stop", wait_response=False, brake=True)
+            self.stop_all(
+                "manual controller stop",
+                wait_response=False,
+                brake=True,
+                source="manual_action",
+            )
             return
         if action not in DIRECTION_MAP:
             raise ValueError("invalid manual action")
@@ -380,7 +418,12 @@ class MotionController:
     ) -> None:
         direction = direction.lower()
         if direction in {"", "none", "stop"}:
-            self.stop_all("manual controller stop", wait_response=False, brake=True)
+            self.stop_all(
+                "manual controller stop",
+                wait_response=False,
+                brake=True,
+                source="manual_winch_action",
+            )
             return
         if direction not in {"forward", "reverse"}:
             raise ValueError("invalid winch direction")
@@ -457,12 +500,22 @@ class MotionController:
                     raise ValueError("invalid winch id")
                 brake_targets = [winch_id]
 
-            self._brake_stop_targets(brake_targets, wait_response=wait_response)
+            self._brake_stop_targets(
+                brake_targets,
+                wait_response=wait_response,
+                source="selected_winch_stop",
+                reason=f"target={target_text}",
+            )
 
             if repeat_brake and target_all:
                 delay_s = max(0.08, min(0.12, float(repeat_brake_after_s)))
                 time.sleep(delay_s)
-                self._brake_stop_targets(brake_targets, wait_response=False)
+                self._brake_stop_targets(
+                    brake_targets,
+                    wait_response=False,
+                    source="selected_winch_stop",
+                    reason=f"target={target_text} repeat",
+                )
 
             if target_all:
                 log.info("ALL STOP END")
@@ -470,10 +523,23 @@ class MotionController:
             if delayed_brake_all:
                 self._brake_stop_all_after_delay(delayed_brake_after_s)
 
-    def _brake_stop_targets(self, brake_targets: List[int], wait_response: bool) -> None:
+    def _brake_stop_targets(
+        self,
+        brake_targets: List[int],
+        wait_response: bool,
+        source: str = "_brake_stop_targets",
+        reason: str = "brake stop",
+    ) -> None:
         for motor_id in brake_targets:
             log.info(f"MOTOR cmd brake-stop motor={motor_id} wait_response={wait_response}")
-            stop_response = self._stop_motor(motor_id, force=True, wait_response=wait_response, brake=True)
+            stop_response = self._stop_motor(
+                motor_id,
+                force=True,
+                wait_response=wait_response,
+                brake=True,
+                source=source,
+                reason=reason,
+            )
             if wait_response and not stop_response:
                 log.error(f"STOP FAILED: no ACK from motor {motor_id}")
 
@@ -485,7 +551,14 @@ class MotionController:
             with self._command_lock:
                 for motor_id in WINCH_IDS:
                     log.info(f"MOTOR cmd delayed brake-stop motor={motor_id} wait_response=False")
-                    self._stop_motor(motor_id, force=True, wait_response=False, brake=True)
+                    self._stop_motor(
+                        motor_id,
+                        force=True,
+                        wait_response=False,
+                        brake=True,
+                        source="_brake_stop_all_after_delay",
+                        reason="delayed brake stop",
+                    )
 
         threading.Thread(target=stop_later, daemon=True).start()
 
@@ -557,7 +630,7 @@ class MotionController:
         finally:
             if not no_motors:
                 try:
-                    self._stop_motors("balance loop stop", brake=True)
+                    self._stop_motors("balance loop stop", brake=True, source="run_balance_loop")
                 except KeyboardInterrupt:
                     pass
         return 0
@@ -605,13 +678,13 @@ class MotionController:
             self._command_motors(targets, rpm)
             time.sleep(max(0.0, seconds))
         except Exception as exc:  # safety: any failure → fault
-            self.safe_brake_all(f"job error {label}: {exc}")
+            self.safe_brake_all(f"job error {label}: {exc}", source="_run_job")
             return
         finally:
             with self._lock:
                 faulted = self.mode == "FAULT" or self.fault is not None
             if not faulted:
-                self._stop_motors("job finished", brake=True)
+                self._stop_motors("job finished", brake=True, source="_run_job")
             with self._lock:
                 self._job_thread = None
                 self._allow_hall_below = False
@@ -629,14 +702,18 @@ class MotionController:
                     if not status.can_move:
                         if status.reason and status.reason.startswith("hall below"):
                             # Arm until hall is above threshold; keep motors stopped.
-                            self._stop_motors_locked("hall below threshold", brake=True)
+                            self._stop_motors_locked(
+                                "hall below threshold",
+                                brake=True,
+                                source="_run_hall_job",
+                            )
                             wait_for_hall = True
                         else:
                             fault_reason = status.reason or "safety stop"
 
                 if fault_reason:
                     log.warning(f"Motion blocked: {fault_reason}")
-                    self.safe_brake_all(fault_reason)
+                    self.safe_brake_all(fault_reason, source="_run_hall_job")
                     return
 
                 if wait_for_hall:
@@ -648,13 +725,13 @@ class MotionController:
                     break
                 time.sleep(POLL_INTERVAL)
         except Exception as exc:  # safety: any failure → fault
-            self.safe_brake_all(f"job error {label}: {exc}")
+            self.safe_brake_all(f"job error {label}: {exc}", source="_run_hall_job")
             return
         finally:
             with self._lock:
                 faulted = self.mode == "FAULT" or self.fault is not None
             if not faulted:
-                self._stop_motors("hall job finished", brake=True)
+                self._stop_motors("hall job finished", brake=True, source="_run_hall_job")
             with self._lock:
                 self._job_thread = None
                 self._setup_hall_active = False
@@ -678,7 +755,14 @@ class MotionController:
                         continue
                     if force:
                         log.info(f"MOTOR cmd stop motor={motor_id} force={force}")
-                    self._stop_motor(motor_id, force=force, wait_response=wait_response, brake=True)
+                    self._stop_motor(
+                        motor_id,
+                        force=force,
+                        wait_response=wait_response,
+                        brake=True,
+                        source="_command_motors",
+                        reason="zero target",
+                    )
                     continue
                 desired_dir = "F" if direction > 0 else "R"
                 command_failed = False
@@ -820,7 +904,11 @@ class MotionController:
         fault_reason = None
         with self._lock:
             if self.mode not in {"SETUP", "TEST"}:
-                self._stop_motors_locked("mode not armed", brake=True)
+                self._stop_motors_locked(
+                    "mode not armed",
+                    brake=True,
+                    source="_motion_allowed_or_stopped",
+                )
                 return False
             status = self._safety.evaluate(self.last_halls, self.last_update)
             if status.can_move:
@@ -830,14 +918,22 @@ class MotionController:
                     return True
                 if self._setup_hall_active:
                     log.info(f"Setup hall stop: {status.reason}")
-                    self._stop_motors_locked("hall below threshold", brake=True)
+                    self._stop_motors_locked(
+                        "hall below threshold",
+                        brake=True,
+                        source="_motion_allowed_or_stopped",
+                    )
                     return False
                 log.warning(f"Motion blocked: {status.reason}")
-                self._stop_motors_locked("hall below threshold", brake=True)
+                self._stop_motors_locked(
+                    "hall below threshold",
+                    brake=True,
+                    source="_motion_allowed_or_stopped",
+                )
                 return False
             fault_reason = status.reason or "safety stop"
         log.warning(f"Motion blocked: {fault_reason}")
-        self._safe_brake_all_under_command_lock(fault_reason)
+        self._safe_brake_all_under_command_lock(fault_reason, source="_motion_allowed_or_stopped")
         return False
 
     def _stop_motor(
@@ -846,12 +942,18 @@ class MotionController:
         force: bool = False,
         wait_response: bool = False,
         brake: bool = True,
+        source: str = "_stop_motor",
+        reason: str = "",
     ):
         state = self._motor_state[motor_id]
         if not force and not state["running"]:
             return b""
         stop_response = None
         try:
+            log.info(
+                f"STOP MOTOR source={source} reason={reason} "
+                f"motor={motor_id} brake={str(bool(brake)).lower()}"
+            )
             stop_response = self.motor.stop(motor_id, wait_response=wait_response, brake=brake)
             if wait_response and not stop_response:
                 log.warning(f"MOTOR no-ack stop motor={motor_id}")
@@ -868,10 +970,17 @@ class MotionController:
         force: bool = False,
         wait_response: bool = False,
         brake: bool = True,
+        source: str = "_stop_motors",
     ):
         with self._command_lock:
             with self._lock:
-                self._stop_motors_locked(reason, force=force, wait_response=wait_response, brake=brake)
+                self._stop_motors_locked(
+                    reason,
+                    force=force,
+                    wait_response=wait_response,
+                    brake=brake,
+                    source=source,
+                )
 
     def _stop_motors_locked(
         self,
@@ -879,9 +988,17 @@ class MotionController:
         force: bool = False,
         wait_response: bool = False,
         brake: bool = True,
+        source: str = "_stop_motors_locked",
     ):
         for mid in WINCH_IDS:
-            self._stop_motor(mid, force=force, wait_response=wait_response, brake=brake)
+            self._stop_motor(
+                mid,
+                force=force,
+                wait_response=wait_response,
+                brake=brake,
+                source=source,
+                reason=reason,
+            )
 
     def _can_move_locked(self) -> bool:
         # caller must hold lock
@@ -935,7 +1052,7 @@ class MotionController:
                                 f"EVB read error: {exc}; backoff={backoff:.2f}s "
                                 f"(count={self._evb_error_count} streak={self._evb_error_streak})"
                             )
-                            self.safe_brake_all(f"EVB error: {exc}")
+                            self.safe_brake_all(f"EVB error: {exc}", source="_poll_loop")
                             had_error = True
                             break
 
@@ -962,9 +1079,17 @@ class MotionController:
                                     if self._allow_hall_below:
                                         pass
                                     elif self._setup_hall_active:
-                                        self._stop_motors_locked("hall below threshold", brake=True)
+                                        self._stop_motors_locked(
+                                            "hall below threshold",
+                                            brake=True,
+                                            source="_poll_loop",
+                                        )
                                     else:
-                                        self._stop_motors_locked("hall below threshold", brake=True)
+                                        self._stop_motors_locked(
+                                            "hall below threshold",
+                                            brake=True,
+                                            source="_poll_loop",
+                                        )
                                 else:
                                     fault_reason = status.reason or "safety stop"
                             log.debug(
@@ -972,7 +1097,7 @@ class MotionController:
                                 f"imu={'ok' if self.last_imu else 'none'}"
                             )
                         if fault_reason:
-                            self.safe_brake_all(fault_reason)
+                            self.safe_brake_all(fault_reason, source="_poll_loop")
 
                         elapsed = time.time() - cycle_start
                         sleep_for = max(0.0, POLL_INTERVAL - elapsed)
@@ -996,14 +1121,14 @@ class MotionController:
                     f"EVB connection failure: {exc}; backoff={backoff:.2f}s "
                     f"(count={self._evb_error_count} streak={self._evb_error_streak})"
                 )
-                self.safe_brake_all(f"EVB connection failure: {exc}")
+                self.safe_brake_all(f"EVB connection failure: {exc}", source="_poll_loop")
                 time.sleep(backoff)
                 backoff = min(EVB_BACKOFF_MAX, backoff * EVB_BACKOFF_FACTOR)
 
     def shutdown(self):
         self._stop_event.set()
         self._poll_thread.join(timeout=1.0)
-        self._stop_motors("shutdown", brake=True)
+        self._stop_motors("shutdown", brake=True, source="shutdown")
         try:
             self.motor.close()
         except Exception:

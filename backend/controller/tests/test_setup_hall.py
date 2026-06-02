@@ -67,13 +67,19 @@ class TestMotionController(MotionController):
         self._lock = threading.Lock()
         self._command_lock = threading.RLock()
         self._stop_requested = threading.Event()
+        self._exclusive_test_active = False
         self.mode = "SETUP"
         self.fault = None
+        self.setup_activated = setup_active
         self.last_halls = halls
         self.last_update = time.time()
         self.last_power = {w: {"bus_mv": 0, "current_ma": 0, "power_mw": 0} for w in WINCH_IDS}
         self.last_bundle = {w: {} for w in WINCH_IDS}
         self.last_imu = None
+        self._evb_error_count = 0
+        self._evb_error_streak = 0
+        self._evb_last_error = None
+        self._evb_last_error_ts = None
         self.motor_available = True
         self.motor_error = None
         self.motor = DummyMotor()
@@ -271,6 +277,29 @@ class TestSetupHall(unittest.TestCase):
         self.assertTrue(finished.is_set())
         self.assertLess(time.monotonic() - start_time, 1.0)
         self.assertEqual(mc.motor.stop_calls, brake_calls(repeat=3))
+        self.assertFalse(mc._exclusive_test_active)
+
+    def test_setup_all_run_test_marks_exclusive_until_stopped(self):
+        halls = {w: HALL_THRESHOLD - 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        mc.mode = "SETUP"
+        finished = threading.Event()
+
+        def run_test():
+            mc.setup_all_run_test(rpm=500, seconds=1.0, direction="forward")
+            finished.set()
+
+        thread = threading.Thread(target=run_test)
+        thread.start()
+        deadline = time.monotonic() + 0.5
+        while not mc._exclusive_test_active and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertTrue(mc._exclusive_test_active)
+        mc._stop_requested.set()
+        thread.join(timeout=0.5)
+        self.assertTrue(finished.is_set())
+        self.assertFalse(mc._exclusive_test_active)
 
     def test_setup_all_run_test_group_targets(self):
         groups = {
@@ -286,6 +315,15 @@ class TestSetupHall(unittest.TestCase):
                 mc.mode = "SETUP"
                 mc.setup_all_run_test(rpm=500, seconds=0, direction="forward", group=group)
                 self.assertEqual(mc.motor.starts, [(motor_id, "F") for motor_id in motors])
+                first_stop_index = next(
+                    (index for index, event in enumerate(mc.motor.events) if event[0] == "stop"),
+                    len(mc.motor.events),
+                )
+                expected_startup_events = []
+                for motor_id in motors:
+                    expected_startup_events.append(("rpm", motor_id, 500, False))
+                    expected_startup_events.append(("start", motor_id, "F", False))
+                self.assertEqual(mc.motor.events[:first_stop_index], expected_startup_events)
 
     def test_setup_all_run_test_blocked_outside_setup(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
@@ -301,6 +339,17 @@ class TestSetupHall(unittest.TestCase):
         self.assertEqual(mc.motor.stops, [1, 2, 3, 4])
         self.assertFalse(mc.motor.last_wait_response)
         self.assertTrue(mc.motor.last_brake)
+
+    def test_stop_motor_logs_source_reason_motor_and_brake(self):
+        halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}
+        mc = TestMotionController(halls=halls, setup_active=False)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            mc._stop_motor(1, force=True, brake=True, source="unit", reason="diagnostic")
+        self.assertIn(
+            "STOP MOTOR source=unit reason=diagnostic motor=1 brake=true",
+            output.getvalue(),
+        )
 
     def test_mode_change_brakes_without_natural_stop(self):
         halls = {w: HALL_THRESHOLD + 1 for w in WINCH_IDS}

@@ -153,6 +153,24 @@ class GamepadControl:
         self._last_block_reason = None
         self._command_in_progress = False
 
+    def _exclusive_test_active(self) -> bool:
+        try:
+            return bool(self.mc.get_status().get("exclusive_test_active"))
+        except Exception:
+            return False
+
+    def _ignore_motor_stop_during_exclusive_test(self, source: str) -> bool:
+        if not self._exclusive_test_active():
+            return False
+        log.info(f"GAMEPAD motor command ignored source={source} reason=exclusive setup test active")
+        with self._lock:
+            self.last_action = "stop"
+            self._last_command_key = None
+            self._last_command_ts = 0.0
+            self._last_stop_ts = time.monotonic()
+            self._command_in_progress = False
+        return True
+
     def status(self):
         with self._lock:
             return {
@@ -217,10 +235,11 @@ class GamepadControl:
             with self._lock:
                 self._monitor_disabled = True
             self._stop.set()
-        try:
-            self.mc.brake_all_now("controller stop", as_fault=False)
-        except Exception:
-            pass
+        if not self._ignore_motor_stop_during_exclusive_test("controller stop"):
+            try:
+                self.mc.brake_all_now("controller stop", as_fault=False, source="gamepad_control.stop")
+            except Exception:
+                pass
         if disable_monitor:
             with self._lock:
                 self.active = False
@@ -246,6 +265,8 @@ class GamepadControl:
             self.last_update = time.time()
 
     def _stop_motors_now(self):
+        if self._ignore_motor_stop_during_exclusive_test("gamepad watchdog stop"):
+            return
         try:
             mode = self.mc.get_status().get("mode")
             previous_command_key = self._last_command_key
@@ -263,7 +284,7 @@ class GamepadControl:
                 finally:
                     self._set_command_in_progress(False)
             else:
-                self.mc.brake_all_now("controller stop", as_fault=False)
+                self.mc.brake_all_now("controller stop", as_fault=False, source="gamepad_control._stop_motors_now")
         except Exception:
             pass
         now = time.monotonic()
@@ -404,6 +425,23 @@ class GamepadControl:
                 snapshot = reader.snapshot()
                 status = self.mc.get_status()
                 mode = status.get("mode")
+                if status.get("exclusive_test_active"):
+                    block_reason = "exclusive setup test"
+                    if block_reason != self._last_block_reason:
+                        log.info(f"GAMEPAD blocked reason={block_reason}")
+                        self._last_block_reason = block_reason
+                    with self._lock:
+                        self.last_inputs = snapshot.active_inputs
+                        self.last_action = "stop"
+                        self.last_update = time.time()
+                        self.axes = snapshot.axes
+                        self.buttons = snapshot.buttons
+                        self.hats = snapshot.hats
+                        self.input_values = self._input_values(snapshot)
+                    self._last_command_key = None
+                    self._last_command_ts = 0.0
+                    time.sleep(0.02)
+                    continue
                 if mode == "SETUP" and mapping.get("enabled", True):
                     self._handle_selection_edges(mapping, snapshot.active_inputs)
                 else:
@@ -425,10 +463,15 @@ class GamepadControl:
                         log.info(f"GAMEPAD blocked reason={block_reason}")
                         self._last_block_reason = block_reason
                     if self._last_command_key != ("disabled", "stop"):
-                        try:
-                            self.mc.brake_all_now("controller disabled", as_fault=False)
-                        except Exception:
-                            pass
+                        if not self._ignore_motor_stop_during_exclusive_test("controller disabled"):
+                            try:
+                                self.mc.brake_all_now(
+                                    "controller disabled",
+                                    as_fault=False,
+                                    source="gamepad_control.disabled",
+                                )
+                            except Exception:
+                                pass
                         self._last_command_key = ("disabled", "stop")
                     time.sleep(0.02)
                     continue
@@ -539,7 +582,11 @@ class GamepadControl:
                                         f"GAMEPAD stop mode={mode} target={stop_target} "
                                         f"input={snapshot.active_inputs} action={action}"
                                     )
-                                self.mc.brake_all_now("controller stop", as_fault=False)
+                                self.mc.brake_all_now(
+                                    "controller stop",
+                                    as_fault=False,
+                                    source="gamepad_control.test_stop",
+                                )
                                 self._last_command_key = stop_key
                                 self._last_command_ts = time.monotonic()
                                 self._last_stop_ts = self._last_command_ts
@@ -552,7 +599,12 @@ class GamepadControl:
                         f"input={snapshot.active_inputs} action={action} error={exc}"
                     )
                     try:
-                        self.mc.brake_all_now("controller dispatch error", as_fault=False)
+                        if not self._ignore_motor_stop_during_exclusive_test("controller dispatch error"):
+                            self.mc.brake_all_now(
+                                "controller dispatch error",
+                                as_fault=False,
+                                source="gamepad_control.dispatch_error",
+                            )
                     except Exception:
                         pass
                     self._last_command_key = None
@@ -569,10 +621,10 @@ class GamepadControl:
                 reason = f"controller connection lost: {exc}"
                 log.error(reason)
                 try:
-                    self.mc.emergency_stop(reason)
+                    self.mc.emergency_stop(reason, source="gamepad_control.connection_lost")
                 except Exception:
                     try:
-                        self.mc.safe_brake_all(reason)
+                        self.mc.safe_brake_all(reason, source="gamepad_control.connection_lost")
                     except Exception:
                         pass
             with self._lock:
@@ -584,10 +636,15 @@ class GamepadControl:
             with self._lock:
                 send_final_stop = not self._monitor_disabled
             if send_final_stop:
-                try:
-                    self.mc.brake_all_now("controller final stop", as_fault=False)
-                except Exception:
-                    pass
+                if not self._ignore_motor_stop_during_exclusive_test("controller final stop"):
+                    try:
+                        self.mc.brake_all_now(
+                            "controller final stop",
+                            as_fault=False,
+                            source="gamepad_control.finally",
+                        )
+                    except Exception:
+                        pass
             with self._lock:
                 self.active = False
 
@@ -742,7 +799,10 @@ def controller_target():
 @app.post("/controller/stop")
 def controller_stop():
     gamepad_control.disable_without_motor_command()
-    mc.brake_all_now("controller stop", as_fault=False)
+    if not mc.get_status().get("exclusive_test_active"):
+        mc.brake_all_now("controller stop", as_fault=False, source="/controller/stop")
+    else:
+        log.info("UI: controller stop ignored motor command during exclusive setup test")
     return ok({"controller": gamepad_control.status()})
 
 
@@ -1211,8 +1271,10 @@ def mode_test():
 def clear_fault():
     try:
         log.info("UI: clear fault")
+        if mc.get_status().get("exclusive_test_active"):
+            return err("exclusive setup test active; use stop")
         gamepad_control.disable_without_motor_command()
-        mc.brake_all_now("clear fault", as_fault=False)
+        mc.brake_all_now("clear fault", as_fault=False, source="/fault/clear")
         mc.clear_fault()
         return ok()
     except Exception as exc:
@@ -1224,7 +1286,7 @@ def stop():
     reason = request.json.get("reason", "user stop") if request.is_json else "user stop"
     log.warning(f"UI: stop ({reason})")
     gamepad_control.disable_without_motor_command()
-    mc.brake_all_now(reason, as_fault=False)
+    mc.brake_all_now(reason, as_fault=False, source="/stop")
     return ok({"stopped": True, "reason": reason})
 
 
@@ -1233,7 +1295,7 @@ def stop_all_fault():
     reason = request.json.get("reason", "emergency stop") if request.is_json else "emergency stop"
     log.warning(f"UI: emergency stop ({reason})")
     gamepad_control.disable_without_motor_command()
-    mc.brake_all_now(reason, as_fault=True)
+    mc.brake_all_now(reason, as_fault=True, source="/stop/all")
     return ok({"stopped": True, "fault": True, "reason": reason})
 
 
@@ -1275,6 +1337,7 @@ def setup_all_run_test():
     group = payload.get("group", "all")
     try:
         log.info(f"UI: setup all-run-test group={group} rpm={rpm} sec={seconds} dir={direction}")
+        gamepad_control.disable_without_motor_command()
         label = mc.setup_all_run_test(rpm=rpm, seconds=seconds, direction=direction, group=group)
         return ok({"job": label})
     except Exception as exc:
